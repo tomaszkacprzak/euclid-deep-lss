@@ -54,19 +54,20 @@ class GaussianMixtureModel:
         """p(theta | summary)"""
 
         mixture_logits = self.mixture_logits_net(summary)  # (batch_size, num_components)
+        mixture_logits = tf.cast(mixture_logits, tf.float32)
 
         loc = self.loc_net(summary)  # (batch_size, num_components * dim_theta)
-        loc = tf.reshape(loc, [-1, self.num_components, self.dim_theta])
+        loc = tf.cast(tf.reshape(loc, [-1, self.num_components, self.dim_theta]), tf.float32)
 
         if self.full_covariance:
             scale_tril = self.scale_net(summary)  # (batch_size, num_components * tril_size)
             scale_tril = tf.reshape(scale_tril, [-1, self.num_components, self.tril_size])
             scale_tril = tfp.math.fill_triangular(scale_tril)
-            scale_tril = tf.reshape(scale_tril, [-1, self.num_components, self.dim_theta, self.dim_theta])
+            scale_tril = tf.cast(tf.reshape(scale_tril, [-1, self.num_components, self.dim_theta, self.dim_theta]), tf.float32)
             component_distribution = tfd.MultivariateNormalTriL(loc=loc, scale_tril=scale_tril)
         else:
             scale = self.scale_net(summary)  # (batch_size, num_components * dim_theta)
-            scale = tf.reshape(scale, [-1, self.num_components, self.dim_theta])
+            scale = tf.cast(tf.reshape(scale, [-1, self.num_components, self.dim_theta]), tf.float32)
             component_distribution = tfd.MultivariateNormalDiag(loc=loc, scale_diag=scale)
 
         mixture_distribution = tfd.Categorical(logits=mixture_logits)
@@ -74,5 +75,7 @@ class GaussianMixtureModel:
         gmm = tfd.MixtureSameFamily(
             mixture_distribution=mixture_distribution, components_distribution=component_distribution
         )
+
+        theta = tf.cast(theta, tf.float32)
 
         return gmm.log_prob(theta)

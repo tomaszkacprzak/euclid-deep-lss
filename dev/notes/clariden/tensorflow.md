@@ -18,7 +18,7 @@ image = "nvcr.io/nvidia/tensorflow:25.02-tf2-py3"
 mounts = [
     "${SCRATCH}:${SCRATCH}",
     "${HOME}/dlss:${HOME}/dlss",
-    "${HOME}/dlss/container_bashrc:${HOME}/.bashrc"
+    "${HOME}/dlss/tf_env_bashrc:${HOME}/.bashrc"
 ]
 workdir = "${HOME}/dlss"
 

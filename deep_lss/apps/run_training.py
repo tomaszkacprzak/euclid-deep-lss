@@ -10,9 +10,13 @@ maximizing loss to find an informative summary statistic.
 Meant for the GPU nodes of the Perlmutter cluster at NERSC.
 """
 
+import os
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
+os.environ['NUMBA_WARNINGS'] = '0'
+
 import tensorflow as tf
 import horovod.tensorflow as hvd
-import os, argparse, warnings, yaml, wandb, shutil
+import argparse, warnings, yaml, wandb, shutil
 
 from datetime import datetime
 from time import time

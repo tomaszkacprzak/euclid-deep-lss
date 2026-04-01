@@ -333,7 +333,7 @@ class GridLossModel(BaseModel):
             # passing an input_signature like above for a distributed dset leads the following error:
             # AttributeError: 'PerReplica' object has no attribute 'dtype'
             # Instead do like https://www.tensorflow.org/tutorials/distribute/input#using_the_element_spec_property
-            @tf.function(jit_compile=self.xla)
+            @tf.function
             def grid_train_step(x, theta):
                 LOGGER.warning(f"Tracing distributed grid_train_step")
                 global_loss = self.distributed_train_step(

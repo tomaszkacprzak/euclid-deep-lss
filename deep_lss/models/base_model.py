@@ -818,9 +818,21 @@ class BaseModel(object):
             z_layer (str, optional): Layer to compute z features for regularization. "penultimate" or "last".
                 Defaults to "last".
         """
+        if getattr(self, "xla", False):
+            LOGGER.warning("Performing a base_train_step as an XLA compiled tf.function")
+
+            @tf.function(jit_compile=True)
+            def compiled_base_step(*args, **kwargs):
+                return self.base_train_step(*args, **kwargs)
+
+            step_fn = compiled_base_step
+        else:
+            LOGGER.warning("Performing a base_train_step in python instead of a tf.function")
+            step_fn = self.base_train_step
+
         # the means here are taken over the local batches
         local_losses = self.strategy.run(
-            self.base_train_step,
+            step_fn,
             args=(
                 input_tensor,
                 loss_function,

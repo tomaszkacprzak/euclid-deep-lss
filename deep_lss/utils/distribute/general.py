@@ -77,7 +77,8 @@ def check_devices():
             n_gpus == n_gpus_cuda
         ), f"The number of GPUs in TensorFlow {n_gpus} and CUDA {n_gpus_cuda} should be equal"
     except KeyError:
-        LOGGER.warning(f"No CUDA enabled GPUs found")
+        if n_gpus == 0:
+            LOGGER.warning(f"No CUDA enabled GPUs found")
 
     return n_cpus, n_gpus
 
