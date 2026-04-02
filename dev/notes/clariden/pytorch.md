@@ -23,12 +23,9 @@ uv venv --python $(which python) --system-site-packages --seed --relocatable --l
 source ~/dlss/torch_env/bin/activate
 
 # install from repos
-uv pip install -e ~/dlss/multiprobe-simulation-forward-model
-uv pip install -e ~/dlss/y3-deep-lss
-uv pip install -e ~/dlss/multiprobe-simulation-inference
-
-# install from pypi
-uv pip install sbi
+uv pip install -e ~/dlss/repos/multiprobe-simulation-forward-model
+uv pip install -e ~/dlss/repos/y3-deep-lss
+uv pip install -e ~/dlss/repos/multiprobe-simulation-inference --override <(echo "pandas>=2.1.0")
 
 # remove pypi version to use the ones from the uenv
 uv pip uninstall torch sympy networkx mpmath
@@ -42,3 +39,4 @@ python -c "import torch; print(torch.cuda.device_count())"
 uv pip install ipykernel
 python -m ipykernel install ${VIRTUAL_ENV:+--env PATH $PATH --env VIRTUAL_ENV $VIRTUAL_ENV} --user --name="torch_env"
 ```
+To launch JupyterLab, specify `pytorch/v2.9.1:v2` in "Custom uenv".

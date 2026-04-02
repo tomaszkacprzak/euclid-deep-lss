@@ -22,7 +22,7 @@ RUN_NUM=${RUN_NUM:-1}
 STRATEGY="mirrored"
 LOSS="mutual_info"
 
-PROJECT="/users/athomsen/dlss"
+REPOS="/users/athomsen/dlss/repos"
 MYSCRATCH="/iopsstor/scratch/cscs/athomsen"
 
 BASE="$MYSCRATCH/deep_lss/$VERSION/$SUBVERSION/maps/$PROBE"
@@ -44,9 +44,9 @@ srun --cpu-bind=threads --gpu-bind=none --output=""$OUTPUT"_training.log" \
         --loss_function=$LOSS \
         --train_tfr_pattern=$TRAIN_TFR \
         --grid_vali_tfr_pattern=$GRID_EVAL_TFR \
-        --dlss_config="$PROJECT/y3-deep-lss/configs/$VERSION/default/$PROBE/dlss.yaml" \
-        --net_config="$PROJECT/y3-deep-lss/configs/$VERSION/deepsphere_default.yaml" \
-        --msfm_config="$PROJECT/multiprobe-simulation-forward-model/configs/$VERSION/$SUBVERSION.yaml" \
+        --dlss_config="$REPOS/y3-deep-lss/configs/$VERSION/default/$PROBE/dlss.yaml" \
+        --net_config="$REPOS/y3-deep-lss/configs/$VERSION/deepsphere_default.yaml" \
+        --msfm_config="$REPOS/multiprobe-simulation-forward-model/configs/$VERSION/$SUBVERSION.yaml" \
         --dist_strategy="$STRATEGY" \
         --wandb \
         --wandb_tags "$VERSION" "$SUBVERSION" "$PROBE" "$LOSS" "$STRATEGY" "resnet" \
