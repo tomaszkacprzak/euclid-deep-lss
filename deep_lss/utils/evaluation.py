@@ -103,7 +103,7 @@ def evaluate_grid(
     LOGGER.info(f"Starting evaluation of the grid")
 
     dset_kwargs = {**net_conf["dset"]["eval"]["common"], **net_conf["dset"]["eval"]["grid"]}
-    dset_kwargs["drop_remainder"] = True    
+    dset_kwargs["drop_remainder"] = True
 
     # network constants
     save_second_to_last_layer = net_conf["network"]["save_second_to_last_layer"]
@@ -159,8 +159,8 @@ def evaluate_grid(
     second_to_last_layer = []
     cosmos = []
     i_sobols = []
+    i_signals = []
     i_noises = []
-    i_examples = []
     for dv_batch, _, cosmo_batch, index_batch in LOGGER.progressbar(
         dist_dset, at_level="info", total=n_batches, desc="evaluating the grid"
     ):
@@ -177,14 +177,14 @@ def evaluate_grid(
         cosmo_batch = strategy.gather(cosmo_batch, axis=0)
         # shape (global_batch_size,) NOTE it's important that gather takes place on the tensor (not tuple) level
         i_sobol_batch = strategy.gather(index_batch[0], axis=0)
-        i_noise_batch = strategy.gather(index_batch[1], axis=0)
-        i_example_batch = strategy.gather(index_batch[2], axis=0)
+        i_signal_batch = strategy.gather(index_batch[1], axis=0)
+        i_noise_batch = strategy.gather(index_batch[2], axis=0)
 
         preds.append(pred_batch)
         cosmos.append(cosmo_batch)
         i_sobols.append(i_sobol_batch)
+        i_signals.append(i_signal_batch)
         i_noises.append(i_noise_batch)
-        i_examples.append(i_example_batch)
         if save_second_to_last_layer:
             second_to_last_layer.append(second_to_last_layer_batch)
 
@@ -196,7 +196,7 @@ def evaluate_grid(
     cosmos = _stack_grid_cosmos(cosmos, sorted_indices, n_examples_per_cosmo)
     i_sobols = _stack_grid_cosmos(i_sobols, sorted_indices, n_examples_per_cosmo)
     i_noises = _stack_grid_cosmos(i_noises, sorted_indices, n_examples_per_cosmo)
-    i_examples = _stack_grid_cosmos(i_examples, sorted_indices, n_examples_per_cosmo)
+    i_signals = _stack_grid_cosmos(i_signals, sorted_indices, n_examples_per_cosmo)
     if save_second_to_last_layer:
         second_to_last_layer = _stack_grid_cosmos(second_to_last_layer_batch, sorted_indices, n_examples_per_cosmo)
     LOGGER.info(f"Reshaped the results")
@@ -208,8 +208,8 @@ def evaluate_grid(
             f.create_dataset(name="grid/preds/test", data=preds)
             f.create_dataset(name="grid/cosmos/test", data=cosmos)
             f.create_dataset(name="grid/i_sobol/test", data=i_sobols)
+            f.create_dataset(name="grid/i_signal/test", data=i_signals)
             f.create_dataset(name="grid/i_noise/test", data=i_noises)
-            f.create_dataset(name="grid/i_example/test", data=i_examples)
             if save_second_to_last_layer:
                 f.create_dataset(name="grid/second_to_last_layer/test", data=second_to_last_layer)
 
