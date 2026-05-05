@@ -62,7 +62,8 @@ uv venv --python $(which python) --system-site-packages --seed --relocatable --l
 source ~/dlss/tf_env/bin/activate
 
 # for compatibility with tf 2.17
-uv pip install tensorflow_probability==0.24 
+uv pip install tensorflow_probability==0.24
+uv pip install tensiometer
 
 # install from repos
 uv pip install -e ~/dlss/repos/multiprobe-simulation-forward-model
@@ -71,7 +72,9 @@ uv pip install -e ~/dlss/repos/multiprobe-simulation-inference
 uv pip install -e ~/dlss/repos/deepsphere-cosmo-tf2
 
 # remove pypi version to use the ones from the container
-uv pip uninstall tensorflow tensorboard keras numpy scipy numba llvmlite protobuf
+uv pip uninstall tensorflow keras numpy ml-dtypes flatbuffers opt-einsum \
+  libclang grpcio tensorboard tensorboard-data-server google-pasta astunparse \
+  termcolor wrapt gast absl-py protobuf h5py optree namex numba llvmlite scipy
 
 # test GPUs
 python -c "import tensorflow as tf; print(tf.config.list_physical_devices('GPU'))"
@@ -92,4 +95,9 @@ To launch JupyterLab, specify `/users/athomsen/.edf/tensorflow.toml` in "Path to
 Go to https://wandb.ai/authorize.
 ```
 wandb login <YOUR_API_KEY>
+```
+
+## misc
+```
+
 ```

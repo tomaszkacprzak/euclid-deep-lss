@@ -30,6 +30,9 @@ uv pip install -e ~/dlss/repos/multiprobe-simulation-inference --override <(echo
 # remove pypi version to use the ones from the uenv
 uv pip uninstall torch sympy networkx mpmath
 
+# for compatibility with sbi package
+uv pip install "arviz<1"
+
 # test GPUs
 python -c "import torch; print(torch.cuda.device_count())"
 ```
@@ -40,3 +43,25 @@ uv pip install ipykernel
 python -m ipykernel install ${VIRTUAL_ENV:+--env PATH $PATH --env VIRTUAL_ENV $VIRTUAL_ENV} --user --name="torch_env"
 ```
 To launch JupyterLab, specify `pytorch/v2.9.1:v2` in "Custom uenv".
+
+## VScode tunnel
+### setup
+```
+# compute node
+srun --uenv=pytorch/v2.9.1:v2 --view=default -A a0158 -t 00:10:00 -n 1 --pty bash
+
+export VSCODE_CLI_DATA_DIR=$HOME/.vscode/cli
+export VSCODE_CLI_USE_FILE_KEYCHAIN=1
+export VSCODE_CLI_DISABLE_KEYCHAIN_ENCRYPT=1
+export HOSTNAME=clariden-fixed
+
+code tunnel user login --provider github
+```
+### usage
+```
+# compute node
+srun --uenv=pytorch/v2.9.1:v2 --view=default -A a0158 -t 00:10:00 -n 1 --pty code tunnel --name=$CLUSTER_NAME-tunnel
+
+# login node
+uenv run --view=default pytorch/v2.9.1:v2 -- code tunnel --name=$CLUSTER_NAME-tunnel
+```
