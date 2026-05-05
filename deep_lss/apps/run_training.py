@@ -10,13 +10,39 @@ maximizing loss to find an informative summary statistic.
 Meant for the GPU nodes of the Perlmutter cluster at NERSC.
 """
 
-import os
-os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
-os.environ['NUMBA_WARNINGS'] = '0'
+import os, sys, threading, warnings
+
+
+def _filter_stderr():
+    fd = sys.stderr.fileno()
+    saved_fd = os.dup(fd)
+    read_fd, write_fd = os.pipe()
+    os.dup2(write_fd, fd)
+    os.close(write_fd)
+    saved_stderr = os.fdopen(saved_fd, "w")
+
+    def pump():
+        with os.fdopen(read_fd, "r") as f:
+            for line in f:
+                if "gpu_timer.cc:114" not in line and "+ptx85" not in line:
+                    saved_stderr.write(line)
+                    saved_stderr.flush()
+
+    t = threading.Thread(target=pump, daemon=True)
+    t.start()
+
+
+_filter_stderr()
+
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
+os.environ["NUMBA_WARNINGS"] = "0"
+warnings.filterwarnings("ignore", category=DeprecationWarning)
+warnings.filterwarnings("ignore", category=RuntimeWarning)
+warnings.filterwarnings("once", category=UserWarning)
 
 import tensorflow as tf
 import horovod.tensorflow as hvd
-import argparse, warnings, yaml, wandb, shutil
+import argparse, yaml, wandb, shutil
 
 from datetime import datetime
 from time import time
@@ -32,9 +58,6 @@ from deep_lss.models.grid_model import GridLossModel
 from deep_lss.utils.distribute import HorovodStrategy
 from deep_lss.nets import NETWORKS
 
-warnings.filterwarnings("ignore", category=DeprecationWarning)
-warnings.filterwarnings("ignore", category=RuntimeWarning)
-warnings.filterwarnings("once", category=UserWarning)
 LOGGER = logger.get_logger(__file__)
 
 
@@ -148,7 +171,20 @@ def setup():
     parser.add_argument("--debug", action="store_true", help="activate debug mode")
     parser.add_argument("--profile", action="store_true", help="run the profiler")
     parser.add_argument("--mixed_precision", action="store_true", help="use mixed precision training")
+    parser.add_argument(
+        "--mixed_precision_dtype",
+        type=str,
+        default="float16",
+        choices=("float16", "bfloat16"),
+        help="mixed precision dtype to use when --mixed_precision is enabled",
+    )
     parser.add_argument("--xla", action="store_true", help="enable XLA (Accelerated Linear Algebra) JIT compilation")
+    parser.add_argument(
+        "--summary_every",
+        type=int,
+        default=1,
+        help="log step_time and global_step summaries every N training steps (set to 1 to keep previous behavior)",
+    )
 
     parser.add_argument("--wandb", action="store_true", help="log to weights & biases, otherwise log to tensorboard")
     parser.add_argument("--wandb_tags", nargs="+", type=str, default=None, help="tags for weights & biases")
@@ -158,6 +194,9 @@ def setup():
     parser.add_argument("--pasc_throughput", action="store_true")
 
     args, _ = parser.parse_known_args()
+
+    if args.summary_every < 1:
+        raise ValueError(f"summary_every must be >= 1, got {args.summary_every}")
 
     if args.loss_function == "delta":
         assert "fiducial" in args.train_tfr_pattern, f"The delta loss can only be used for the fiducial dataset"
@@ -186,8 +225,9 @@ def setup():
         LOGGER.info(f"{key} = {value}")
 
     if args.mixed_precision:
-        LOGGER.warning(f"Using mixed precision")
-        tf.keras.mixed_precision.set_global_policy("mixed_float16")
+        policy_name = f"mixed_{args.mixed_precision_dtype}"
+        LOGGER.warning(f"Using mixed precision policy {policy_name}")
+        tf.keras.mixed_precision.set_global_policy(policy_name)
 
         if args.loss_function == "delta":
             LOGGER.warning(
@@ -386,6 +426,7 @@ def training():
 
     with_lensing = dlss_conf["dset"]["common"]["with_lensing"]
     with_clustering = dlss_conf["dset"]["common"]["with_clustering"]
+    with_cross = dlss_conf["dset"]["common"].get("with_cross", False)
 
     # constants: network
     n_steps = net_conf["training"]["n_steps"]
@@ -445,6 +486,8 @@ def training():
             n_z_bins += len(msfm_conf["survey"]["metacal"]["z_bins"])
         if with_clustering:
             n_z_bins += len(msfm_conf["survey"]["maglim"]["z_bins"])
+        if with_cross:
+            n_z_bins += len(msfm_conf["survey"]["metacal"]["z_bins"]) * len(msfm_conf["survey"]["maglim"]["z_bins"])
 
     # dataset
     LOGGER.warning(f"Training set")
@@ -471,6 +514,7 @@ def training():
             out_features=n_output, smoothing_kwargs=smoothing_kwargs, **net_conf["network"]["kwargs"]
         ).get_layers()
         LOGGER.info(f"Loaded a network specification of type {NETWORKS[net_conf['network']['name']]}")
+        LOGGER.info(f"Network kwargs including regularization: {net_conf['network']['kwargs']}")
 
         optimizer = optimization.get_optimizer(net_conf, args.loss_function, args.restore_checkpoint)
 
@@ -479,6 +523,7 @@ def training():
             n_side=n_side,
             indices=data_vec_pix,
             n_neighbors=net_conf["network"]["n_neighbors"],
+            z_bank_size=net_conf["network"]["z_bank_size"],
             max_checkpoints=net_conf["network"]["max_checkpoints"],
             optimizer=optimizer,
             input_shape=(None, len(data_vec_pix), n_z_bins),
@@ -488,6 +533,7 @@ def training():
             restore_checkpoint=args.restore_checkpoint,
             strategy=strategy,
             xla=args.xla,
+            summary_every=args.summary_every,
         )
 
         # training step, fiducial pipeline
@@ -525,6 +571,7 @@ def training():
             if args.loss_function == "mutual_info":
                 mutual_info_kwargs = {
                     "dim_summary": n_output,
+                    **dlss_conf["mutual_info_loss"]["regu"],
                     "mutual_info_estimator": dlss_conf["mutual_info_loss"]["estimator"],
                     "mutual_info_kwargs": dlss_conf["mutual_info_loss"]["kwargs"],
                 }
@@ -549,11 +596,10 @@ def training():
         vali_dset_kwargs["drop_remainder"] = True
         n_vali_batches = net_conf["dset"]["validation"]["n_batches"]
 
-        @tf.function
         def vali_merge_mean(losses):
             losses = tf.stack(losses, axis=0)
             # to ignore NaNs, which can occur if the batch size is too large, such that some workers get empty batches
-            losses = tf.reduce_mean(tf.boolean_mask(losses, not tf.math.is_nan(losses)))
+            losses = tf.reduce_mean(tf.boolean_mask(losses, ~tf.math.is_nan(losses)))
             return losses
 
         if args.fidu_vali_tfr_pattern is not None:
@@ -666,8 +712,8 @@ def training():
                 # reset the summary writer step to what it was before the validation
                 model.change_step(-n_steps)
 
-                model.write_summary("loss_vali", vali_loss)
-                model.write_summary("loss_vali_non_regu", vali_loss_non_regu)
+                model.write_summary("loss/vali_total", vali_loss)
+                model.write_summary("loss/vali_main", vali_loss_non_regu)
 
                 return n_steps
 
@@ -727,7 +773,10 @@ def training():
 
                 # reset the summary writer step to what it was before the validation
                 model.change_step(-n_steps)
-                model.write_summary("loss_vali", vali_loss)
+                model.write_summary("loss/vali_total", vali_loss)
+                # vali_loss_fn has no z-regularization, so total == main; log both keys for
+                # consistency with the fiducial validation path
+                model.write_summary("loss/vali_main", vali_loss)
 
                 return n_steps
 
@@ -740,12 +789,19 @@ def training():
         # optional context like https://stackoverflow.com/a/34798330
         with tf.profiler.experimental.Trace("step", step_num=step, _r=1) if args.profile else nullcontext():
             # train step
+            t_data_start = time()
             if args.loss_function == "delta":
                 dv_batch, _, index_batch = next(dist_iter)
+                t_data_end = time()
                 loss = model.delta_train_step(dv_batch)
             else:
                 dv_batch, _, cosmo_batch, index_batch = next(dist_iter)
-                loss = model.grid_train_step(dv_batch, cosmo_batch)
+                t_data_end = time()
+                if getattr(model, "grid_train_step_uses_pair_ids", False):
+                    loss = model.grid_train_step(dv_batch, cosmo_batch, index_batch[0], index_batch[1])
+                else:
+                    loss = model.grid_train_step(dv_batch, cosmo_batch)
+            t_compute_end = time()
 
             # horovod
             if isinstance(model.strategy, HorovodStrategy) and step == 1:
@@ -756,10 +812,12 @@ def training():
             if args.loss_function == "delta" and not args.restore_checkpoint and noise_schedule_steps is not None:
                 # assignment has to happen outside the tf.function
                 noise_scale.assign(noise_scheduler(step))
+                model.write_summary("schedule/noise_scale", noise_scale)
 
             # likelihood loss
             if args.loss_function == "likelihood" and not args.restore_checkpoint:
                 lambda_tikhonov.assign(lambda_tikhonov_schedule(step))
+                model.write_summary("schedule/lambda_tikhonov", lambda_tikhonov)
 
             # output
             if (output_every is not None) and (step % output_every == 0):
@@ -883,8 +941,11 @@ def training():
 
             # additional logs
             t_now = time()
-            model.write_summary("step_time", t_now - t_prev)
-            model.write_summary("global_step", step)
+            if step % args.summary_every == 0:
+                model.write_summary("step_time", t_now - t_prev)
+                model.write_summary("data_time", t_data_end - t_data_start)
+                model.write_summary("compute_time", t_compute_end - t_data_end)
+                model.write_summary("global_step", step)
             t_prev = t_now
 
     LOGGER.info(f"Finished training after {n_steps} steps and {LOGGER.timer.elapsed('training')}")

@@ -407,7 +407,7 @@ def delta_loss(
     # parameters. So nothing happens here if n_output = n_params, because then cov_det only has one entry.
     cov_det_loss = tf.reduce_mean(cov_det_loss)
     summary.write_summary(
-        "delta_cov_det_loss" + summary_suffix, cov_det_loss, summary_writer, training, print_scalar=print_scalar
+        "loss/delta_cov_det" + summary_suffix, cov_det_loss, summary_writer, training, print_scalar=print_scalar
     )
 
     loss = cov_det_loss
@@ -415,7 +415,7 @@ def delta_loss(
     # jacobian loss (log of this is unstable)
     if jac_weight is not None:
         if cov_loss:
-            jac_label = "delta_covariance_loss"
+            jac_label = "loss/delta_covariance"
 
             diff = tf.subtract(cov, tf.expand_dims(tf.eye(n_output, n_output, dtype=current_float), axis=0))
             jac_loss = tf.reduce_mean(tf.square(diff), axis=(1, 2))
@@ -429,7 +429,7 @@ def delta_loss(
 
         # NOTE this is the default branch
         else:
-            jac_label = "delta_jacobian_loss"
+            jac_label = "loss/delta_jacobian"
 
             # shape (n_output/n_params, n_output, n_output)
             diff = tf.subtract(jacobian, tf.expand_dims(tf.eye(n_output, n_params, dtype=current_float), axis=0))
@@ -466,7 +466,7 @@ def delta_loss(
         jac_cond_loss = tf.scalar_mul(jac_cond_weight, jac_cond_loss)
 
         summary.write_summary(
-            "delta_jacobian_condition_loss" + summary_suffix,
+            "loss/delta_jacobian_cond" + summary_suffix,
             jac_cond_loss,
             summary_writer,
             training,
@@ -505,7 +505,7 @@ def delta_loss(
             diff_loss = hvd.allreduce(diff_loss)
 
         summary.write_summary(
-            "delta_diff_loss" + summary_suffix, diff_loss, summary_writer, training, print_scalar=print_scalar
+            "loss/delta_diff" + summary_suffix, diff_loss, summary_writer, training, print_scalar=print_scalar
         )
         loss = tf.add(loss, diff_loss)
 

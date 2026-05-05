@@ -54,6 +54,7 @@ class GridLossModel(BaseModel):
         z_bank_size=None,
         strategy=None,
         xla=False,
+        summary_every=1,
     ):
         """Initializes a graph convolutional neural network using the healpy pixelization scheme.
 
@@ -88,6 +89,7 @@ class GridLossModel(BaseModel):
             xla (bool, optional): Whether to enable XLA just in time compilation. Note that this is incompatible with
                 the DeepSphere graph convolutional layers, as they contain unsupported
                 SparseDenseMatirxMultiplications. Defaults to False.
+            summary_every (int, optional): Write TensorBoard summaries every N training steps. Defaults to 1.
         """
 
         # init the base model
@@ -103,6 +105,7 @@ class GridLossModel(BaseModel):
             init_step=init_step,
             strategy=strategy,
             xla=xla,
+            summary_every=summary_every,
             # DeepSphere
             n_side=n_side,
             indices=indices,
@@ -162,10 +165,14 @@ class GridLossModel(BaseModel):
             clip_by_global_norm (tf.tensor, optional): Clip the gradients by global norm. Defaults to 10.0.
             l2_norm_weight (float, optional): Weight for the L2 norm of the trainable weights. Defaults to None
                 (no regularization).
-            z_weight (float, optional): Weight for the regularization of features z in the penultimate layer.
-                Defaults to None (no regularization).
-            z_type (str, optional): Type of regularization for z features, either "covariance" (VICReg variance and
-                covariance terms) or "mmd" (Maximum Mean Discrepancy penalty for standard Gaussian). Defaults to None.
+            z_weight (float | dict | None, optional): Weight(s) for z-feature regularization. For
+                ``z_type="vicreg"`` this is a dict ``{variance: float|None, covariance: float|None,
+                invariance: float|None}`` (each term independently weighted; setting a term to None disables
+                it). For ``z_type="mmd"`` or ``"sw"`` it is a single float. When the invariance term is set,
+                ``grid_train_step`` requires the ``i_sobol`` and ``i_signal`` index tensors as additional
+                inputs, and the memory bank (``z_bank_size``) must be disabled. Defaults to None.
+            z_type (str, optional): Type of regularization for z features. One of ``"vicreg"``, ``"mmd"``,
+                ``"sw"``. Defaults to None.
             z_layer (str, optional): Layer to compute z features for regularization. "penultimate" or "last".
                 Defaults to "last".
             img_summary (bool, optional): Whether to write image summaries of the covariance matrix. Defaults to False.
@@ -181,6 +188,36 @@ class GridLossModel(BaseModel):
 
         if self.xla:
             LOGGER.warning(f"Using XLA just in time compilation")
+
+        # the VICReg invariance term needs per-sample (i_sobol, i_signal) ids; derived once here so the
+        # downstream closure builders, the early-error check, and the startup log all stay consistent.
+        uses_invariance = (
+            z_type == "vicreg"
+            and isinstance(z_weight, dict)
+            and z_weight.get("invariance") is not None
+        )
+
+        if uses_invariance and self.z_bank_size is not None:
+            raise NotImplementedError(
+                "The VICReg invariance term (z_weight['invariance']) is not yet supported in conjunction with "
+                "the z memory bank (z_bank_size). The bank stores features without pair_ids, so positive "
+                "matches against bank entries cannot be made. Set one or the other to None."
+            )
+
+        # surface which z-regularization terms are active at startup so it's obvious from the run header
+        if z_weight is None:
+            LOGGER.info("z regularization: none")
+        elif z_type == "vicreg":
+            assert isinstance(z_weight, dict), (
+                f"For z_type='vicreg', z_weight must be a dict with keys 'variance', 'covariance', "
+                f"'invariance' (each a float or None); got {type(z_weight).__name__}."
+            )
+            active = [f"{name}={z_weight.get(name)}" for name in ("variance", "covariance", "invariance")]
+            bank_str = f", bank_size={self.z_bank_size}" if self.z_bank_size is not None else ""
+            LOGGER.warning(f"z regularization active: vicreg ({', '.join(active)}, layer={z_layer}{bank_str})")
+        else:
+            bank_str = f", bank_size={self.z_bank_size}" if self.z_bank_size is not None else ""
+            LOGGER.warning(f"z regularization active: {z_type} (weight={z_weight}, layer={z_layer}{bank_str})")
 
         vali_loss_kwargs = {}
         if loss == "mse":
@@ -297,63 +334,123 @@ class GridLossModel(BaseModel):
         if input_shape is not None:
             current_float = get_backend_floatx()
             label_shape = (batch_size, dim_theta)
-            tf_kwargs = {
-                "input_signature": [
-                    tf.TensorSpec(shape=input_shape, dtype=current_float),
-                    tf.TensorSpec(shape=label_shape, dtype=current_float),
-                ]
-            }
+            input_signature = [
+                tf.TensorSpec(shape=input_shape, dtype=current_float),
+                tf.TensorSpec(shape=label_shape, dtype=current_float),
+            ]
+            if uses_invariance:
+                # extra (i_sobol, i_signal) inputs forwarded by the training loop, used as positive-pair ids
+                index_shape = (batch_size,)
+                input_signature.extend(
+                    [tf.TensorSpec(shape=index_shape, dtype=tf.int64)] * 2
+                )
+            tf_kwargs = {"input_signature": input_signature}
         else:
             tf_kwargs = {}
 
         # not distributed via tensorflow builtin
         if (self.strategy is None) or isinstance(self.strategy, HorovodStrategy):
 
-            @tf.function(jit_compile=self.xla, **tf_kwargs)
-            def grid_train_step(x, theta):
-                LOGGER.warning(f"Tracing grid_train_step")
-                loss = self.base_train_step(
-                    input_tensor=x,
-                    input_labels=theta,
-                    loss_function=loss_fn,
-                    # gradient clipping + regularization
-                    clip_by_value=clip_by_value,
-                    clip_by_norm=clip_by_norm,
-                    clip_by_global_norm=clip_by_global_norm,
-                    l2_norm_weight=l2_norm_weight,
-                    z_weight=z_weight,
-                    z_type=z_type,
-                    z_layer=z_layer,
-                )
+            if not uses_invariance:
 
-                return loss
+                @tf.function(jit_compile=self.xla, **tf_kwargs)
+                def grid_train_step(x, theta):
+                    LOGGER.warning(f"Tracing grid_train_step")
+                    loss = self.base_train_step(
+                        input_tensor=x,
+                        input_labels=theta,
+                        loss_function=loss_fn,
+                        # gradient clipping + regularization
+                        clip_by_value=clip_by_value,
+                        clip_by_norm=clip_by_norm,
+                        clip_by_global_norm=clip_by_global_norm,
+                        l2_norm_weight=l2_norm_weight,
+                        z_weight=z_weight,
+                        z_type=z_type,
+                        z_layer=z_layer,
+                    )
+
+                    return loss
+
+            else:
+
+                @tf.function(jit_compile=self.xla, **tf_kwargs)
+                def grid_train_step(x, theta, i_sobol, i_signal):
+                    LOGGER.warning(f"Tracing grid_train_step (with VICReg invariance)")
+                    # pair_ids is forwarded as a tuple — stacking happens inside base_train_step where
+                    # the tensors are no longer wrapped in PerReplica (cf. distributed grid_train_step).
+                    loss = self.base_train_step(
+                        input_tensor=x,
+                        input_labels=theta,
+                        loss_function=loss_fn,
+                        # gradient clipping + regularization
+                        clip_by_value=clip_by_value,
+                        clip_by_norm=clip_by_norm,
+                        clip_by_global_norm=clip_by_global_norm,
+                        l2_norm_weight=l2_norm_weight,
+                        z_weight=z_weight,
+                        z_type=z_type,
+                        z_layer=z_layer,
+                        pair_ids=(i_sobol, i_signal),
+                    )
+
+                    return loss
 
         # distributed via tensorflow builtin
         elif isinstance(self.strategy, tf.distribute.Strategy):
             # passing an input_signature like above for a distributed dset leads the following error:
             # AttributeError: 'PerReplica' object has no attribute 'dtype'
             # Instead do like https://www.tensorflow.org/tutorials/distribute/input#using_the_element_spec_property
-            @tf.function
-            def grid_train_step(x, theta):
-                LOGGER.warning(f"Tracing distributed grid_train_step")
-                global_loss = self.distributed_train_step(
-                    input_tensor=x,
-                    input_labels=theta,
-                    loss_function=loss_fn,
-                    # gradient clipping + regularization
-                    clip_by_value=clip_by_value,
-                    clip_by_norm=clip_by_norm,
-                    clip_by_global_norm=clip_by_global_norm,
-                    l2_norm_weight=l2_norm_weight,
-                    z_weight=z_weight,
-                    z_type=z_type,
-                    z_layer=z_layer,
-                )
+            if not uses_invariance:
 
-                return global_loss
+                @tf.function
+                def grid_train_step(x, theta):
+                    LOGGER.warning(f"Tracing distributed grid_train_step")
+                    global_loss = self.distributed_train_step(
+                        input_tensor=x,
+                        input_labels=theta,
+                        loss_function=loss_fn,
+                        # gradient clipping + regularization
+                        clip_by_value=clip_by_value,
+                        clip_by_norm=clip_by_norm,
+                        clip_by_global_norm=clip_by_global_norm,
+                        l2_norm_weight=l2_norm_weight,
+                        z_weight=z_weight,
+                        z_type=z_type,
+                        z_layer=z_layer,
+                    )
+
+                    return global_loss
+
+            else:
+
+                @tf.function
+                def grid_train_step(x, theta, i_sobol, i_signal):
+                    LOGGER.warning(f"Tracing distributed grid_train_step (with VICReg invariance)")
+                    # pair_ids is forwarded as a tuple of PerReplica tensors — strategy.run distributes each
+                    # leaf independently, and the stack into a (B, 2) tensor happens inside base_train_step
+                    # where the per-replica unwrapping has already taken place.
+                    global_loss = self.distributed_train_step(
+                        input_tensor=x,
+                        input_labels=theta,
+                        loss_function=loss_fn,
+                        # gradient clipping + regularization
+                        clip_by_value=clip_by_value,
+                        clip_by_norm=clip_by_norm,
+                        clip_by_global_norm=clip_by_global_norm,
+                        l2_norm_weight=l2_norm_weight,
+                        z_weight=z_weight,
+                        z_type=z_type,
+                        z_layer=z_layer,
+                        pair_ids=(i_sobol, i_signal),
+                    )
+
+                    return global_loss
 
         else:
             raise ValueError(f"Invalid strategy {self.strategy} was passed")
 
         LOGGER.info(f"Set up the training step of the {loss} loss")
         self.grid_train_step = grid_train_step
+        # tells the training loop whether to forward the (i_sobol, i_signal) tensors
+        self.grid_train_step_uses_pair_ids = uses_invariance

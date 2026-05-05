@@ -52,6 +52,7 @@ class DeltaLossModel(BaseModel):
         init_step=0,
         strategy=None,
         xla=False,
+        summary_every=1,
     ):
         """Initializes a graph convolutional neural network using the healpy pixelization scheme.
 
@@ -84,6 +85,7 @@ class DeltaLossModel(BaseModel):
             xla (bool, optional): Whether to enable XLA just in time compilation. Note that this is incompatible with
                 the DeepSphere graph convolutional layers, as they contain unsupported
                 SparseDenseMatirxMultiplications. Defaults to False.
+            summary_every (int, optional): Write TensorBoard summaries every N training steps. Defaults to 1.
         """
 
         assert (
@@ -103,6 +105,7 @@ class DeltaLossModel(BaseModel):
             init_step=init_step,
             strategy=strategy,
             xla=xla,
+            summary_every=summary_every,
             # DeepSphere
             n_side=n_side,
             indices=indices,

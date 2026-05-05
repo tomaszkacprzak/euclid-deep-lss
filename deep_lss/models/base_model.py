@@ -44,6 +44,7 @@ class BaseModel(object):
         init_step=0,
         strategy=None,
         xla=False,
+        summary_every=1,
         z_bank_size=None,
         # DeepSphere
         n_side=None,
@@ -122,6 +123,7 @@ class BaseModel(object):
         self.init_step = init_step
         self.strategy = strategy
         self.xla = xla
+        self.summary_every = summary_every
         self.z_bank_size = z_bank_size
         self.z_bank = None
         self.z_bank_index = None
@@ -316,10 +318,20 @@ class BaseModel(object):
         self.network.summary(**kwargs)
 
     def write_summary(self, label, value, summary_type="scalar", skip=False):
-        # this is part of the model graph, so has to be executed with every step. An additional condition like
-        # step % log_every_n_steps == 0 is therefore not feasible
-        if (self.summary_writer is not None) and (not skip):
-            with self.summary_writer.as_default():
+        # `record_if` defers the write to a runtime condition, so this can be called every step without
+        # actually emitting every step. Two gates: (a) only the chief replica writes — under MirroredStrategy
+        # every replica would otherwise call into the same writer with the same step; (b) only every Nth step
+        # writes when summary_every > 1.
+        if (self.summary_writer is None) or skip:
+            return
+
+        record_cond = tf.equal(self.train_step % self.summary_every, 0)
+        replica_ctx = tf.distribute.get_replica_context()
+        if replica_ctx is not None:
+            record_cond = tf.logical_and(record_cond, tf.equal(replica_ctx.replica_id_in_sync_group, 0))
+
+        with self.summary_writer.as_default():
+            with tf.summary.record_if(record_cond):
                 if summary_type == "scalar":
                     tf.summary.scalar(label, value)
                 elif summary_type == "histogram":
@@ -414,19 +426,21 @@ class BaseModel(object):
         hvd.broadcast_variables(self.network.weights, root_rank=0)
         hvd.broadcast_variables(self.optimizer.variables(), root_rank=0)
 
-    def _compute_vicreg_loss(self, z):
-        """Compute VICReg variance and covariance loss terms for standardizing features.
+    def _compute_vicreg_var_cov_loss(self, z):
+        """Compute the VICReg variance and covariance loss terms separately.
 
-        This implements the variance and covariance terms from VICReg https://arxiv.org/abs/2105.04906 to encourage
-        the features to have unit variance and zero covariance between dimensions.
-        In the paper, they penalize a hinge loss to make sure tha variance is greater than one. Here, penalize any
-        deviations from one to standardize the features.
+        Implements the variance and covariance terms from VICReg https://arxiv.org/abs/2105.04906 to encourage
+        the features to have unit variance and zero covariance between dimensions. The paper penalizes a hinge
+        loss to make sure the variance is greater than one; here we penalize any deviation from one to
+        standardize the features.
+
+        Returned as two separate scalars so callers (e.g. :meth:`base_train_step`) can apply per-term weights.
 
         Args:
-            z (tf.tensor): Features from the penultimate layer, shape (batch_size, feature_dim)
+            z (tf.tensor): Features, shape (batch_size, feature_dim).
 
         Returns:
-            tf.tensor: Scalar loss combining variance and covariance regularization
+            tuple[tf.tensor, tf.tensor]: ``(var_loss, cov_loss)``.
         """
         batch_size = tf.cast(tf.shape(z)[0], tf.float32)
         feature_dim = tf.cast(tf.shape(z)[1], tf.float32)
@@ -443,7 +457,49 @@ class BaseModel(object):
         # normalize by number of off-diagonal elements to keep scale consistent with var_loss
         cov_loss = cov_loss / (feature_dim**2 - feature_dim)
 
-        return var_loss + cov_loss
+        return var_loss, cov_loss
+
+    def _compute_vicreg_invariance_loss(self, z, pair_ids):
+        """Compute the VICReg invariance term: mean squared distance between feature pairs that share the same
+        pair_id (excluding self-pairs). Together with the variance + covariance terms in
+        :meth:`_compute_vicreg_var_cov_loss`, this completes the VICReg triple https://arxiv.org/abs/2105.04906.
+
+        Positives are identified opportunistically from the batch — typically samples sharing
+        ``(i_sobol, i_signal)`` but differing in the noise realization, which the shuffle buffer happens to land
+        in the same (global) batch. Returns 0 (with zero gradient) if no positive pairs exist in the batch.
+
+        Also writes two diagnostic scalars (cheap, derived from the same mask used for the loss):
+            - ``z_invariance/n_positive_pairs``: number of unordered positive pairs in the (global) batch.
+              If this is dominantly zero, the invariance term is doing nothing and ``examples_shuffle_buffer``
+              should be raised so positives co-occur more often.
+            - ``z_invariance/n_anchored_samples``: number of samples that have at least one positive partner.
+
+        Args:
+            z (tf.tensor): Features, shape (B, feature_dim). Should be the global batch (already all-gathered)
+                when running with a multi-replica strategy.
+            pair_ids (tf.tensor): Integer pair identifiers, shape (B, K). Two samples are positives when all K
+                components match. Typically K = 2 for ``(i_sobol, i_signal)``.
+
+        Returns:
+            tf.tensor: Scalar invariance loss.
+        """
+        match = tf.reduce_all(pair_ids[:, None, :] == pair_ids[None, :, :], axis=-1)
+        mask = match & ~tf.eye(tf.shape(z)[0], dtype=tf.bool)
+        mask_f = tf.cast(mask, z.dtype)
+
+        # diagnostics — mask is symmetric, so the unordered pair count is half the entry sum
+        n_pair_entries = tf.reduce_sum(mask_f)
+        self.write_summary("z_invariance/n_positive_pairs", n_pair_entries / 2.0, skip=self.xla)
+        self.write_summary(
+            "z_invariance/n_anchored_samples",
+            tf.reduce_sum(tf.cast(tf.reduce_any(mask, axis=1), z.dtype)),
+            skip=self.xla,
+        )
+
+        diff = z[:, None, :] - z[None, :, :]
+        pairwise_mse = tf.reduce_mean(tf.square(diff), axis=-1)
+
+        return tf.math.divide_no_nan(tf.reduce_sum(pairwise_mse * mask_f), n_pair_entries)
 
     def _compute_mmd_loss(self, z, interpretable=False):
         """Compute Maximum Mean Discrepancy loss between features and standard Gaussian.
@@ -562,8 +618,27 @@ class BaseModel(object):
             tuple: (z_loss_input, z_scale) where z_loss_input is the concatenation of z_features and z_bank,
                    and z_scale is the scaling factor for the loss.
         """
+        # All-gather z across replicas so every replica works with the full global batch.
+        # This must happen before the early return so that no-bank regularization losses
+        # (VICReg, MMD, SW) also see the global batch: with only local_batch_size=32 samples
+        # the sample covariance matrix is rank-deficient when n_output >= 32, and gradient
+        # variance is 4x higher than necessary.
+        # For the bank case: without gather all replicas write to the same indices with
+        # different per-replica data (last writer wins), bank_index advances by local_batch_size
+        # instead of global_batch_size, and z_scale is inflated by num_replicas.
+        #
+        # num_replicas is folded into z_scale to cancel the 1/R factor introduced by the
+        # gradient all-reduce in distributed_train_step. Without this correction, the effective
+        # z_weight would be R× weaker with MirroredStrategy than with strategy=None.
+        replica_context = tf.distribute.get_replica_context()
+        if replica_context is not None and replica_context.num_replicas_in_sync > 1:
+            num_replicas = tf.cast(replica_context.num_replicas_in_sync, tf.float32)
+            z = replica_context.all_gather(z, axis=0)
+        else:
+            num_replicas = 1.0
+
         if self.z_bank_size is None:
-            return z, 1.0
+            return z, num_replicas
 
         if self.z_bank is None:
             LOGGER.info(f"Initializing z memory bank with size {self.z_bank_size}")
@@ -575,11 +650,11 @@ class BaseModel(object):
             )
             self.z_bank_index = tf.Variable(0, trainable=False, name="z_bank_index", dtype=tf.int64)
 
-        # update the bank
+        # update the bank (batch_size is now the global batch size after all_gather)
         batch_size = tf.shape(z)[0]
         indices = (self.z_bank_index + tf.range(batch_size, dtype=tf.int64)) % self.z_bank_size
         update_indices = tf.expand_dims(indices, 1)
-        self.z_bank.scatter_nd_update(update_indices, z)
+        self.z_bank.assign(tf.tensor_scatter_nd_update(self.z_bank, update_indices, z))
         self.z_bank_index.assign((self.z_bank_index + tf.cast(batch_size, tf.int64)) % self.z_bank_size)
 
         # concatenate the bank to the features
@@ -590,7 +665,10 @@ class BaseModel(object):
             batch_size, tf.float32
         )
 
-        return z_loss_input, z_scale
+        # log the bank dilution factor — the multiplier applied on top of the user-set z_weight
+        self.write_summary("z_bank/scale", z_scale, skip=self.xla)
+
+        return z_loss_input, z_scale * num_replicas
 
     def train_step(
         self,
@@ -604,6 +682,7 @@ class BaseModel(object):
         z_weight=None,
         z_type=None,
         z_layer="last",
+        pair_ids=None,
     ):
         # non distributed
         if self.strategy is None:
@@ -618,6 +697,7 @@ class BaseModel(object):
                 z_weight=z_weight,
                 z_type=z_type,
                 z_layer=z_layer,
+                pair_ids=pair_ids,
             )
 
         # distributed
@@ -633,6 +713,7 @@ class BaseModel(object):
                 z_weight=z_weight,
                 z_type=z_type,
                 z_layer=z_layer,
+                pair_ids=pair_ids,
             )
 
         else:
@@ -650,6 +731,7 @@ class BaseModel(object):
         z_weight=None,
         z_type=None,
         z_layer="last",
+        pair_ids=None,
     ):
         """A base train step given a loss funtion and an input tensor. The method evaluates the network and performs a
         single gradient decent step. Note that it should be wrapped in a tf.function. If multiple clippings are
@@ -670,12 +752,19 @@ class BaseModel(object):
                 clipping).
             l2_norm_weight (float, optional): Weight for the L2 norm of the trainable weights. Defaults to None
                 (no regularization).
-            z_weight (float, optional): Weight for the regularization of features z in the penultimate layer.
-                Defaults to None (no regularization).
-            z_type (str, optional): Type of regularization for z features, either "cov" (VICReg variance and
-                covariance terms) or "mmd" (Maximum Mean Discrepancy penalty for standard Gaussian). Defaults to None.
+            z_weight (float | dict | None): Weight(s) for the regularization of features z. Polymorphic by
+                ``z_type``: for ``z_type="vicreg"`` this is a dict with keys ``variance``, ``covariance``,
+                ``invariance`` (each maps to a float weight or None to disable that term); for ``z_type="mmd"``
+                or ``"sw"`` this is a single float. Defaults to None (no regularization).
+            z_type (str, optional): Type of regularization for z features. One of ``"vicreg"`` (variance,
+                covariance, and invariance terms; positives for the invariance term are identified via
+                ``pair_ids``), ``"mmd"`` (Maximum Mean Discrepancy against standard Gaussian), or ``"sw"``
+                (Sliced Wasserstein against standard Gaussian). Defaults to None.
             z_layer (str, optional): Layer to compute z features for regularization. "penultimate" or "last".
                 Defaults to "last".
+            pair_ids (tuple of tf.tensor, optional): Tuple of per-sample integer identifier tensors, each of
+                shape (B,), used to identify positive pairs for the VICReg invariance term. Required when
+                ``z_type="vicreg"`` and ``z_weight["invariance"]`` is set; ignored otherwise.
         """
         LOGGER.warning("Performing a base_train_step in python instead of a tf.function")
 
@@ -690,16 +779,17 @@ class BaseModel(object):
                 loss = loss_function(predictions)
             else:
                 loss = loss_function(predictions, input_labels)
-            self.write_summary("loss", loss, skip=self.xla)
+            self.write_summary("loss/main", loss, skip=self.xla)
 
             # handle the l2 norm
             if l2_norm_weight is not None:
                 l2_loss = tf.linalg.global_norm(self.trainable_variables)
-                self.write_summary("l2_loss", l2_loss, skip=self.xla)
+                self.write_summary("loss/l2_reg", l2_loss, skip=self.xla)
+                self.write_summary("loss/l2_reg_weighted", l2_norm_weight * l2_loss, skip=self.xla)
 
                 loss = loss + l2_norm_weight * l2_loss
 
-            # handle the z regularization
+            # z-feature regularization: compute z_features once and dispatch on z_type
             if z_weight is not None:
                 if z_layer == "penultimate":
                     z_features = input_tensor
@@ -710,24 +800,78 @@ class BaseModel(object):
                 else:
                     raise ValueError(f"Invalid z_layer '{z_layer}', must be 'penultimate' or 'last'")
 
-                # memory bank
-                z_input, z_scale = self._update_and_get_z_bank(z_features)
+                if z_type == "vicreg":
+                    assert isinstance(z_weight, dict), (
+                        f"For z_type='vicreg', z_weight must be a dict with keys 'variance', 'covariance', "
+                        f"'invariance' (each a float or None); got {type(z_weight).__name__}."
+                    )
+                    var_w = z_weight.get("variance")
+                    cov_w = z_weight.get("covariance")
+                    inv_w = z_weight.get("invariance")
 
-                if z_type == "cov":
-                    LOGGER.info("Using VICReg covariance loss for z regularization")
-                    z_loss = self._compute_vicreg_loss(z_input)
+                    # variance and covariance share the bank-augmented features
+                    if var_w is not None or cov_w is not None:
+                        z_input, z_scale = self._update_and_get_z_bank(z_features)
+                        var_loss, cov_loss = self._compute_vicreg_var_cov_loss(z_input)
+
+                        if var_w is not None:
+                            self.write_summary("loss/z_variance_reg", var_loss, skip=self.xla)
+                            self.write_summary("loss/z_variance_weighted", var_w * var_loss, skip=self.xla)
+                            loss = loss + var_w * z_scale * var_loss
+                        if cov_w is not None:
+                            self.write_summary("loss/z_covariance_reg", cov_loss, skip=self.xla)
+                            self.write_summary("loss/z_covariance_weighted", cov_w * cov_loss, skip=self.xla)
+                            loss = loss + cov_w * z_scale * cov_loss
+
+                    # invariance: pulls positives (samples sharing pair_ids) together. Uses its own all_gather
+                    # over the global batch and deliberately does not consult the memory bank because bank
+                    # entries carry no pair_id (mutual exclusion is enforced in setup_grid_loss_step).
+                    #
+                    # `pair_ids` arrives as a tuple of K rank-1 tensors (e.g. (i_sobol, i_signal)). Stacking is
+                    # deferred to here because stacking PerReplica tensors fails outside `strategy.run`; by the
+                    # time we reach base_train_step the per-replica unwrapping has taken place.
+                    if inv_w is not None:
+                        assert pair_ids is not None, "pair_ids must be passed when z_weight['invariance'] is set"
+
+                        replica_context = tf.distribute.get_replica_context()
+                        if replica_context is not None and replica_context.num_replicas_in_sync > 1:
+                            num_replicas_inv = tf.cast(replica_context.num_replicas_in_sync, tf.float32)
+                            z_inv_input = replica_context.all_gather(z_features, axis=0)
+                            pair_ids_gathered = tuple(replica_context.all_gather(p, axis=0) for p in pair_ids)
+                        else:
+                            num_replicas_inv = 1.0
+                            z_inv_input = z_features
+                            pair_ids_gathered = pair_ids
+
+                        pair_ids_stacked = tf.stack(list(pair_ids_gathered), axis=-1)
+                        inv_loss = self._compute_vicreg_invariance_loss(z_inv_input, pair_ids_stacked)
+                        self.write_summary("loss/z_invariance_reg", inv_loss, skip=self.xla)
+                        self.write_summary("loss/z_invariance_weighted", inv_w * inv_loss, skip=self.xla)
+
+                        # num_replicas factor cancels the 1/R from the gradient all-reduce in
+                        # distributed_train_step, matching the convention used by z_scale in
+                        # _update_and_get_z_bank.
+                        loss = loss + inv_w * num_replicas_inv * inv_loss
+
                 elif z_type == "mmd":
-                    LOGGER.info("Using MMD loss for z regularization")
+                    z_input, z_scale = self._update_and_get_z_bank(z_features)
                     z_loss = self._compute_mmd_loss(z_input)
+                    self.write_summary("loss/z_mmd_reg", z_loss, skip=self.xla)
+                    self.write_summary("loss/z_mmd_weighted", z_weight * z_loss, skip=self.xla)
+                    loss = loss + z_weight * z_scale * z_loss
+
                 elif z_type == "sw":
-                    LOGGER.info("Using Sliced Wasserstein loss for z regularization")
+                    z_input, z_scale = self._update_and_get_z_bank(z_features)
                     z_loss = self._compute_sw_loss(z_input)
+                    self.write_summary("loss/z_sw_reg", z_loss, skip=self.xla)
+                    self.write_summary("loss/z_sw_weighted", z_weight * z_loss, skip=self.xla)
+                    loss = loss + z_weight * z_scale * z_loss
+
                 else:
-                    raise ValueError(f"Invalid z_type {z_type}. Must be 'cov', 'mmd', or 'sw'.")
+                    raise ValueError(f"Invalid z_type {z_type}. Must be 'vicreg', 'mmd', or 'sw'.")
 
-                self.write_summary(f"z_{z_type}_loss", z_loss, skip=self.xla)
-
-                loss = loss + z_weight * z_scale * z_loss
+            # log the total loss that is backpropagated (after all regularization)
+            self.write_summary("loss/total", loss, skip=self.xla)
 
             # mixed precision
             if isinstance(self.optimizer, tf.keras.mixed_precision.LossScaleOptimizer):
@@ -739,12 +883,12 @@ class BaseModel(object):
 
         gradients = tape.gradient(loss, self.trainable_variables)
 
-        # NOTE distribute delta loss, get global gradients on the level of the gradients for the builtin strategies
-        if isinstance(self.strategy, tf.distribute.Strategy):
-            gradients = tf.distribute.get_replica_context().all_reduce("MEAN", gradients)
-
         if isinstance(self.optimizer, tf.keras.mixed_precision.LossScaleOptimizer):
             gradients = self.optimizer.get_unscaled_gradients(gradients)
+
+        # # NOTE distribute delta loss, get global gradients on the level of the gradients for the builtin strategies
+        # if isinstance(self.strategy, tf.distribute.Strategy):
+        #     gradients = tf.distribute.get_replica_context().all_reduce("MEAN", gradients)
 
         # clip the gradients
         if clip_by_value is not None:
@@ -757,12 +901,23 @@ class BaseModel(object):
 
         if clip_by_global_norm is not None:
             gradients, _ = tf.clip_by_global_norm(gradients, clip_by_global_norm, use_norm=glob_norm)
+            # post-clip norm: ratio against pre-clip tells you the clipping fraction directly
+            self.write_summary("global_grad_norm_post_clip", tf.linalg.global_norm(gradients), skip=self.xla)
 
         # apply gradients
         self.optimizer.apply_gradients(zip(gradients, self.trainable_variables))
 
-        # update the step
-        self.increment_step()
+        # weight norm — a steadily growing/shrinking value is one of the cleanest early signals of L2
+        # misconfiguration. Logged after the optimizer step so it reflects the post-update weights.
+        self.write_summary(
+            "params/global_norm", tf.linalg.global_norm(self.network.trainable_variables), skip=self.xla
+        )
+
+        # update the step — skip inside strategy.run() because each replica would increment
+        # independently, making train_step grow N× per global step. distributed_train_step
+        # calls increment_step() once after strategy.run() returns.
+        if tf.distribute.get_replica_context() is None:
+            self.increment_step()
 
         # log the learning rate
         current_learning_rate = self.optimizer.learning_rate
@@ -784,6 +939,7 @@ class BaseModel(object):
         z_weight=None,
         z_type=None,
         z_layer="last",
+        pair_ids=None,
     ):
         """A distributed train step to be used in conjunction with a tf.distribute.Strategy like in
         https://www.tensorflow.org/tutorials/distribute/custom_training.
@@ -811,12 +967,14 @@ class BaseModel(object):
                 clipping).
             l2_norm_weight (float, optional): Weight for the L2 norm of the trainable weights. Defaults to None
                 (no regularization).
-            z_weight (float, optional): Weight for the regularization of features z in the penultimate layer.
-                Defaults to None (no regularization).
-            z_type (str, optional): Type of regularization for z features, either "cov" (VICReg variance and
-                covariance terms) or "mmd" (Maximum Mean Discrepancy penalty for standard Gaussian). Defaults to None.
+            z_weight (float | dict | None): See :meth:`base_train_step`. For ``z_type="vicreg"`` this is a
+                dict with per-term keys; for ``"mmd"``/``"sw"`` a single float.
+            z_type (str, optional): One of ``"vicreg"``, ``"mmd"``, ``"sw"``. Defaults to None.
             z_layer (str, optional): Layer to compute z features for regularization. "penultimate" or "last".
                 Defaults to "last".
+            pair_ids (tuple of tf.tensor, optional): Per-sample identifier tensors. Required when
+                ``z_type="vicreg"`` and ``z_weight["invariance"]`` is set. The local-replica slice is forwarded
+                to ``base_train_step``, where each component is all-gathered to the global batch and stacked.
         """
         if getattr(self, "xla", False):
             LOGGER.warning("Performing a base_train_step as an XLA compiled tf.function")
@@ -844,6 +1002,7 @@ class BaseModel(object):
                 z_weight,
                 z_type,
                 z_layer,
+                pair_ids,
             ),
         )
 
@@ -854,7 +1013,9 @@ class BaseModel(object):
             f" of replicas, ensure that this is the case"
         )
         global_loss = self.strategy.reduce(tf.distribute.ReduceOp.MEAN, local_losses, axis=None)
-        self.write_summary("global_loss", global_loss, skip=self.xla)
+        self.write_summary("loss/total_global", global_loss, skip=self.xla)
+
+        self.increment_step()
 
         return global_loss
 

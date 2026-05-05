@@ -113,9 +113,9 @@ def neg_likelihood_loss(
     mean_Lt_residual_norm = tf.reduce_mean(Lt_residual_norm)
 
     if not xla:
-        summary.write_summary("likelihood_log_det_loss" + summary_suffix, mean_log_det, summary_writer, training)
+        summary.write_summary("loss/likelihood_log_det" + summary_suffix, mean_log_det, summary_writer, training)
         summary.write_summary(
-            "likelihood_residual_loss" + summary_suffix, mean_Lt_residual_norm, summary_writer, training
+            "loss/likelihood_residual" + summary_suffix, mean_Lt_residual_norm, summary_writer, training
         )
 
     neg_likelihood_loss = tf.add(mean_Lt_residual_norm, mean_log_det)
@@ -126,7 +126,7 @@ def neg_likelihood_loss(
         mean_frob_norm = tf.reduce_mean(frob_norm)
         tikhonov_loss = -lambda_tikhonov * mean_frob_norm
         if not xla:
-            summary.write_summary("likelihood_tikhonov_loss" + summary_suffix, tikhonov_loss, summary_writer, training)
+            summary.write_summary("loss/likelihood_tikhonov" + summary_suffix, tikhonov_loss, summary_writer, training)
 
         neg_likelihood_loss = tf.add(neg_likelihood_loss, tikhonov_loss)
 
