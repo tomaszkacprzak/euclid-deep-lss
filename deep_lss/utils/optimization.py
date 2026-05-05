@@ -37,12 +37,12 @@ def get_optimizer(net_conf, loss_function="delta_loss", restore_checkpoint=False
 
     # set up learning rate scheduler
     scheduler = net_conf["optimization"][loss_function]["scheduler"]
-    learning_rate = net_conf["optimization"][loss_function]["learning_rate"]
+    learning_rate = float(net_conf["optimization"][loss_function]["learning_rate"])
     if scheduler is None:
         learning_rate_schedule = learning_rate
         LOGGER.info(f"Using constant learning rate {learning_rate}")
     elif scheduler == "cosine":
-        warmup_init_learning_rate = net_conf["optimization"][loss_function]["warmup_init_learning_rate"]
+        warmup_init_learning_rate = float(net_conf["optimization"][loss_function]["warmup_init_learning_rate"])
         warmup_steps = net_conf["optimization"][loss_function]["warmup_steps"]
         decay_steps = net_conf["training"]["n_steps"] - warmup_steps
         end_divided_by_init_learning_rate = net_conf["optimization"][loss_function]["decay_alpha"]

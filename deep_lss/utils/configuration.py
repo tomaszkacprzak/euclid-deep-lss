@@ -65,15 +65,22 @@ def get_smoothing_kwargs(loss_function, msfm_conf, dlss_conf, net_conf, dir_base
     # dlss
     with_lensing = dlss_conf["dset"]["common"]["with_lensing"]
     with_clustering = dlss_conf["dset"]["common"]["with_clustering"]
+    with_cross = dlss_conf["dset"]["common"].get("with_cross", False)
 
-    if with_lensing and with_clustering:
+    if with_cross:
+        # mirrors the per-pixel mask used in msfm.grid_pipeline._augmentations for the cross maps:
+        # AND of the two probe masks, broadcast across all n_z_cross channels.
+        mask_metacal_total = np.prod(mask_dict["metacal"], axis=-1, keepdims=True)
+        mask_maglim_total = np.prod(mask_dict["maglim"], axis=-1, keepdims=True)
+        mask = mask_metacal_total * mask_maglim_total
+    elif with_lensing and with_clustering:
         mask = np.concatenate([mask_dict["metacal"], mask_dict["maglim"]], axis=1)
     elif with_lensing and not with_clustering:
         mask = mask_dict["metacal"]
     elif not with_lensing and with_clustering:
         mask = mask_dict["maglim"]
     else:
-        raise ValueError("At least one of with_lensing and with_clustering must be True")
+        raise ValueError("At least one of with_lensing, with_clustering, or with_cross must be True")
 
     try:
         fwhm = []
@@ -87,6 +94,23 @@ def get_smoothing_kwargs(loss_function, msfm_conf, dlss_conf, net_conf, dir_base
             fwhm += dlss_conf["scale_cuts"]["clustering"]["theta_fwhm"]
             white_noise_sigma += dlss_conf["scale_cuts"]["clustering"]["white_noise_sigma"]
             map_normalization += msfm_conf["analysis"]["normalization"]["clustering"]
+        if with_cross:
+            # The 16 (n_z_metacal x n_z_maglim) cross bins are always derived from the lensing and clustering blocks
+            # above. alm_cross = sqrt(alm_k * alm_d) → effective Gaussian beam sigma_b^2 averages, and for independent
+            # zero-mean complex Gaussian white noise the cross alm has <|alm_cross|^2> = (pi/4) * sigma_k * sigma_d *
+            # Omega_pix (still flat in l).
+            fwhm_k = np.asarray(dlss_conf["scale_cuts"]["lensing"]["theta_fwhm"], dtype=float)
+            fwhm_d = np.asarray(dlss_conf["scale_cuts"]["clustering"]["theta_fwhm"], dtype=float)
+            sig_k = np.asarray(dlss_conf["scale_cuts"]["lensing"]["white_noise_sigma"], dtype=float)
+            sig_d = np.asarray(dlss_conf["scale_cuts"]["clustering"]["white_noise_sigma"], dtype=float)
+            # outer-product over (i_metacal, j_maglim), flattened in (i * n_z_maglim + j) order
+            # to match the cross-map ordering in msfm.apps.run_grid_postprocessing
+            fwhm_cross = np.sqrt((fwhm_k[:, None] ** 2 + fwhm_d[None, :] ** 2) / 2.0).ravel()
+            sigma_cross = np.sqrt(np.pi / 4.0) * np.sqrt(sig_k[:, None] * sig_d[None, :]).ravel()
+            fwhm += fwhm_cross.tolist()
+            white_noise_sigma += sigma_cross.tolist()
+            # cross maps are not normalized in msfm.grid_pipeline._augmentations
+            map_normalization += [1.0] * fwhm_cross.size
 
         arcmin = dlss_conf["scale_cuts"]["arcmin"]
         n_sigma_support = dlss_conf["scale_cuts"]["n_sigma_support"]
