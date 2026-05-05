@@ -61,3 +61,5 @@ mutual_info_loss:
     num_hidden_units: 128
     activation: "relu"
     full_covariance: True
+  regu:
+    z_weight: Null
