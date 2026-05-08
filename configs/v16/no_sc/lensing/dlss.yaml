@@ -3,6 +3,8 @@ dset:
   common:
     with_lensing: True
     with_clustering: False
+    with_cross_z: True
+    with_cross_probe: False
     apply_norm: True
     return_maps: True
     return_cls: False

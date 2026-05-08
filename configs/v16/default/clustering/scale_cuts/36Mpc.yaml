@@ -3,34 +3,32 @@ dset:
   common:
     with_lensing: False
     with_clustering: True
-    with_cross_z: True
-    with_cross_probe: False
     apply_norm: True
     return_maps: True
     return_cls: False
   training:
-    params: [Om, s8, w0, bg1, bg2, bg3, bg4]
+    params: [ Om, s8, w0, bg1, bg2, bg3, bg4 ]
   eval:
     fiducial:
       params: []
     grid:
-      params: [Om, s8, w0, bg1, bg2, bg3, bg4]
+      params: [ Om, s8, w0, bg1, bg2, bg3, bg4 ]
 
 scale_cuts:
   n_sigma_support: 3
   arcmin: True
   lensing:
-    # 8 Mpc/h transverse comoving scale -> arcmin
-    theta_fwhm: [29.5, 20.1, 15.0, 12.6]
-    # 1 % noise threshold, l_maxs = [589, 863, 1159, 1382]
-    white_noise_sigma: [3.0275e-04, 4.0448e-04, 4.8782e-04, 5.2049e-04]
-    l_max: [589, 863, 1159, 1382]
+    # 14 Mpc/h transverse comoving scale -> arcmin
+    theta_fwhm: [ 51.6, 35.2, 26.2, 22.0 ]
+    # 1 % noise threshold, l_maxs = [336, 493, 662, 789]
+    white_noise_sigma: [ 4.6533e-4, 6.3996e-4, 8.0566e-4, 8.4511e-4 ]
+    l_max: [ 336, 493, 662, 789 ]
   clustering:
-    # 32 Mpc/h transverse comoving scale -> arcmin
-    theta_fwhm: [130.2, 88.9, 68.1, 57.0]
-    # 1 % noise threshold, l_maxs = [133, 195, 255, 305]
-    white_noise_sigma: [8.5135e-01, 3.4375e-01, 2.5989e-01, 2.4127e-01]
-    l_max: [133, 195, 255, 305]
+    # 36 Mpc/h transverse comoving scale -> arcmin
+    theta_fwhm: [ 146.5, 100.0, 76.6, 64.2 ]
+    # 1 % noise threshold, l_maxs = [119, 174, 227, 271]
+    white_noise_sigma: [ 1.0176e+0, 4.7044e-1, 4.773e-1, 4.9179e-1 ]
+    l_max: [ 119, 174, 227, 271 ]
 
 delta_loss:
   # regularization
@@ -42,7 +40,7 @@ delta_loss:
   # numerical stability
   use_log_det: True
   tikhonov_regu: False
-  eps: 1.0e-32
+  eps: 1e-32
   # misc
   img_summary: False
 
