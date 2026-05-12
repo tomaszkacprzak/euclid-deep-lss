@@ -10,7 +10,6 @@
 #SBATCH --job-name=training
 #SBATCH --output=/users/athomsen/dlss/repos/y3-deep-lss/submissions/clariden/slurm/slurm-%j.out
 
-RUN_NUM=${RUN_NUM:-1}
 REPOS="/users/athomsen/dlss/repos"
 STRATEGY="mirrored"
 LOSS="mutual_info"
@@ -22,35 +21,26 @@ SUBVERSION="default"
 
 # MODEL="40Mpc"
 MODEL="v5"
-# MODEL="v1_inv"
-# MODEL="debug/v2"
 
-PROBE="lensing"
-# PROBE="clustering"
+# PROBE="lensing"
+PROBE="clustering"
 # PROBE="cross"
 # PROBE="combined"
 
 MYSCRATCH="/iopsstor/scratch/cscs/athomsen"
 INPUT="$MYSCRATCH/deep_lss/data/$VERSION/$SUBVERSION"
 OUTPUT="$MYSCRATCH/deep_lss/runs/$VERSION/$SUBVERSION/maps/$PROBE"
-LOG="$OUTPUT/$MODEL/logs/"$RUN_NUM"_"$STRATEGY"_"$SLURM_JOB_ID""
+LOG="$OUTPUT/$MODEL/logs/"$STRATEGY"_"$SLURM_JOB_ID""
 
 TRAIN_TFR="$INPUT/tfrecords/grid/DESy3_grid_dmb_????.tfrecord"
 GRID_EVAL_TFR=$TRAIN_TFR
 
-# extract Weights & Biases API key from the host's .netrc file and pass it as an environment variable
-# to accommodate containerized execution that might not inherit the host's home directory mounts properly.
 export WANDB_API_KEY=$(awk '/password/ {print $2}' ~/.netrc)
 
-# Optimize OpenMP and TensorFlow thread pools for the 288 available CPU cores
 export OMP_NUM_THREADS=${SLURM_CPUS_PER_TASK}
 export TF_NUM_INTRAOP_THREADS=${SLURM_CPUS_PER_TASK}
 
-# add --restore_checkpoint only for RUN_NUM > 1
-RESTORE_FLAG=""
-if [ "$RUN_NUM" -gt 1 ]; then
-    RESTORE_FLAG="--restore_checkpoint"
-fi
+echo $MODEL
 
 srun --environment=tensorflow --gpu-bind=none --output=""$LOG"_training.log" \
     python $REPOS/y3-deep-lss/deep_lss/apps/run_training.py \
@@ -59,15 +49,9 @@ srun --environment=tensorflow --gpu-bind=none --output=""$LOG"_training.log" \
         --loss_function=$LOSS \
         --train_tfr_pattern=$TRAIN_TFR \
         --grid_vali_tfr_pattern=$GRID_EVAL_TFR \
-        --msfm_config="$REPOS/multiprobe-simulation-forward-model/configs/$VERSION/$SUBVERSION.yaml" \
-        --dlss_config="$REPOS/y3-deep-lss/configs/$VERSION/$SUBVERSION/$PROBE/scale_cuts/40Mpc.yaml" \
-        --net_config="$REPOS/y3-deep-lss/configs/$VERSION/$SUBVERSION/$PROBE/deepsphere_256.yaml" \
         --dist_strategy="$STRATEGY" \
-        --wandb \
-        --wandb_tags "$VERSION" "$SUBVERSION" "$PROBE" "$LOSS" "$STRATEGY" "resnet" \
-        $RESTORE_FLAG
-        # --dlss_config="$REPOS/y3-deep-lss/configs/$VERSION/$SUBVERSION/$PROBE/dlss.yaml" \
-        # --net_config="$REPOS/y3-deep-lss/configs/$VERSION/$SUBVERSION/$PROBE/deepsphere_debug.yaml" \
+        --restore_checkpoint \
+        --wandb
 
 srun --environment=tensorflow --gpu-bind=none --output=""$LOG"_inference.log" \
     python $REPOS/y3-deep-lss/deep_lss/apps/run_evaluation.py \
