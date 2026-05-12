@@ -131,6 +131,14 @@ if __name__ == "__main__":
     n_side = msfm_conf["analysis"]["n_side"]
     data_vec_pix, _, _, _ = files.load_pixel_file(msfm_conf)
 
+    smooth_nside = net_conf["network"].get("smooth_nside", None)
+    if smooth_nside is not None and smooth_nside < n_side:
+        smooth_indices, _ = configuration.get_smooth_nside_indices(data_vec_pix, n_side, smooth_nside)
+        LOGGER.info(f"Using smooth_nside={smooth_nside}: {len(data_vec_pix)} → {len(smooth_indices)} pixels")
+    else:
+        smooth_nside = n_side
+        smooth_indices = data_vec_pix
+
     n_z_bins = 0
     if dlss_conf["dset"]["common"]["with_lensing"]:
         n_z_bins += len(msfm_conf["survey"]["metacal"]["z_bins"])
@@ -183,10 +191,10 @@ if __name__ == "__main__":
         # build the model, same regardless of the loss function (fiducial or grid)
         model = BaseModel(
             network=network,
-            n_side=n_side,
-            indices=data_vec_pix,
+            n_side=smooth_nside,
+            indices=smooth_indices,
             n_neighbors=net_conf["network"]["n_neighbors"],
-            input_shape=(None, len(data_vec_pix), n_z_bins),
+            input_shape=(None, len(smooth_indices), n_z_bins),
             max_batch_size=net_conf["dset"]["eval"]["grid"]["local_batch_size"],
             checkpoint_dir=checkpoint_dir,
             # always load from a checkpoint

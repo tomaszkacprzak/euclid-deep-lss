@@ -60,6 +60,10 @@ from deep_lss.nets import NETWORKS
 
 LOGGER = logger.get_logger(__file__)
 
+# Keys present in dlss.yaml dset.common that are only meaningful for Cls (2pt) training
+# and unknown to FiducialPipeline / GridPipeline — strip them before splatting into pipe_kwargs.
+_CLS_ONLY_KEYS = frozenset({"with_cross_z", "with_cross_probe", "ggl_only"})
+
 
 def setup():
     description = "Train the specified network at the fiducial cosmology."
@@ -419,6 +423,15 @@ def training():
     n_side = msfm_conf["analysis"]["n_side"]
     data_vec_pix, _, _, _ = files.load_pixel_file(msfm_conf)
 
+    smooth_nside = net_conf["network"].get("smooth_nside", None)
+    if smooth_nside is not None and smooth_nside < n_side:
+        smooth_indices, parent_output_idx = configuration.get_smooth_nside_indices(data_vec_pix, n_side, smooth_nside)
+        LOGGER.info(f"Using smooth_nside={smooth_nside}: {len(data_vec_pix)} → {len(smooth_indices)} pixels")
+    else:
+        smooth_nside = n_side
+        smooth_indices = data_vec_pix
+        parent_output_idx = None
+
     # constants: deep_lss
     params = dlss_conf["dset"]["training"]["params"]
     n_params = len(params)
@@ -491,7 +504,8 @@ def training():
 
     # dataset
     LOGGER.warning(f"Training set")
-    pipe_kwargs = {**dlss_conf["dset"]["common"], **dlss_conf["dset"]["training"], **noise_kwargs}
+    pipe_kwargs = {k: v for k, v in {**dlss_conf["dset"]["common"], **dlss_conf["dset"]["training"], **noise_kwargs}.items()
+                   if k not in _CLS_ONLY_KEYS}
     train_pipeline = Pipeline(conf=msfm_conf, **pipe_kwargs)
 
     # like https://www.tensorflow.org/tutorials/distribute/input#tfdistributestrategydistribute_datasets_from_function
@@ -501,6 +515,9 @@ def training():
             **dset_kwargs,
             # distribution
             input_context=input_context,
+            # nside downsampling
+            downsample_nside=smooth_nside if parent_output_idx is not None else None,
+            parent_output_idx=parent_output_idx,
         )
 
         return dset
@@ -520,13 +537,13 @@ def training():
 
         model = Model(
             network=network,
-            n_side=n_side,
-            indices=data_vec_pix,
+            n_side=smooth_nside,
+            indices=smooth_indices,
             n_neighbors=net_conf["network"]["n_neighbors"],
             z_bank_size=net_conf["network"]["z_bank_size"],
             max_checkpoints=net_conf["network"]["max_checkpoints"],
             optimizer=optimizer,
-            input_shape=(None, len(data_vec_pix), n_z_bins),
+            input_shape=(None, len(smooth_indices), n_z_bins),
             max_batch_size=effective_local_batch_size,
             checkpoint_dir=checkpoint_dir,
             summary_dir=summary_dir,
@@ -591,7 +608,7 @@ def training():
 
     # validation loss
     if vali_every is not None:
-        vali_pipe_kwargs = dlss_conf["dset"]["common"]
+        vali_pipe_kwargs = {k: v for k, v in dlss_conf["dset"]["common"].items() if k not in _CLS_ONLY_KEYS}
         vali_dset_kwargs = net_conf["dset"]["validation"]["common"]
         vali_dset_kwargs["drop_remainder"] = True
         n_vali_batches = net_conf["dset"]["validation"]["n_batches"]
@@ -679,6 +696,8 @@ def training():
                     tfr_pattern=args.fidu_vali_tfr_pattern,
                     **vali_dset_kwargs,
                     input_context=input_context,
+                    downsample_nside=smooth_nside if parent_output_idx is not None else None,
+                    parent_output_idx=parent_output_idx,
                 )
                 if n_vali_batches is not None:
                     dset = dset.take(n_vali_batches * strategy.num_replicas_in_sync)
@@ -730,6 +749,8 @@ def training():
                     tfr_pattern=args.grid_vali_tfr_pattern,
                     **vali_dset_kwargs,
                     input_context=input_context,
+                    downsample_nside=smooth_nside if parent_output_idx is not None else None,
+                    parent_output_idx=parent_output_idx,
                 )
                 if n_vali_batches is not None:
                     dset = dset.take(n_vali_batches * strategy.num_replicas_in_sync)

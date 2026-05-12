@@ -14,9 +14,9 @@ from trianglechain import TriangleChain
 
 from msfm.fiducial_pipeline import FiducialPipeline
 from msfm.grid_pipeline import GridPipeline
-from msfm.utils import logger
+from msfm.utils import logger, files
 
-from deep_lss.utils import distribute
+from deep_lss.utils import distribute, configuration
 from deep_lss.utils.distribute import HorovodStrategy
 
 warnings.filterwarnings("ignore", category=DeprecationWarning)
@@ -110,6 +110,15 @@ def evaluate_grid(
 
     strategy = model.strategy
 
+    n_side = msfm_conf["analysis"]["n_side"]
+    smooth_nside = net_conf["network"].get("smooth_nside", None)
+    if smooth_nside is not None and smooth_nside < n_side:
+        data_vec_pix, _, _, _ = files.load_pixel_file(msfm_conf)
+        _, parent_output_idx = configuration.get_smooth_nside_indices(data_vec_pix, n_side, smooth_nside)
+    else:
+        smooth_nside = None
+        parent_output_idx = None
+
     grid_pipeline = GridPipeline(
         conf=msfm_conf, **{**dlss_conf["dset"]["common"], **dlss_conf["dset"]["eval"]["grid"]}
     )
@@ -121,6 +130,9 @@ def evaluate_grid(
             **dset_kwargs,
             # distribution
             input_context=input_context,
+            # nside downsampling
+            downsample_nside=smooth_nside,
+            parent_output_idx=parent_output_idx,
         )
 
         if debug:
@@ -278,6 +290,15 @@ def evaluate_fiducial(
             f"{strategy.num_replicas_in_sync} times the local batch size {local_batch_size}"
         )
 
+    n_side = msfm_conf["analysis"]["n_side"]
+    smooth_nside = net_conf["network"].get("smooth_nside", None)
+    if smooth_nside is not None and smooth_nside < n_side:
+        data_vec_pix, _, _, _ = files.load_pixel_file(msfm_conf)
+        _, parent_output_idx = configuration.get_smooth_nside_indices(data_vec_pix, n_side, smooth_nside)
+    else:
+        smooth_nside = None
+        parent_output_idx = None
+
     fiducial_pipeline = FiducialPipeline(
         conf=msfm_conf, **{**dlss_conf["dset"]["common"], **dlss_conf["dset"]["eval"]["fiducial"]}
     )
@@ -289,6 +310,9 @@ def evaluate_fiducial(
             **dset_kwargs,
             # distribution
             input_context=input_context,
+            # nside downsampling
+            downsample_nside=smooth_nside,
+            parent_output_idx=parent_output_idx,
         )
 
         return dset

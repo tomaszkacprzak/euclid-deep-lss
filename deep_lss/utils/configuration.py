@@ -44,6 +44,34 @@ def load_deep_lss_config(conf=None):
     return conf
 
 
+def get_smooth_nside_indices(indices_nside_in, nside_in, smooth_nside):
+    """Derive footprint pixel indices and a parent-mapping array at smooth_nside from nside_in indices.
+
+    For HEALPix NEST ordering, pixel j at nside_in belongs to parent pixel j // downscale at smooth_nside, where
+    downscale = (nside_in / smooth_nside)^2. The returned parent_output_idx maps each nside_in pixel to its
+    (0-based) row in the smooth_nside output tensor.
+
+    Args:
+        indices_nside_in (np.ndarray): 1-D array of HEALPix NEST pixel indices at nside_in.
+        nside_in (int): Input HEALPix resolution parameter (power of 2).
+        smooth_nside (int): Target HEALPix resolution parameter (power of 2, < nside_in).
+
+    Returns:
+        smooth_indices (np.ndarray): Sorted 1-D array of unique NEST pixel indices at smooth_nside covering the
+            footprint.
+        parent_output_idx (np.ndarray): 1-D int array of length len(indices_nside_in). Entry j gives the row index
+            in smooth_indices that nside_in pixel j maps to.
+    """
+    assert nside_in % smooth_nside == 0, f"nside_in {nside_in} must be divisible by smooth_nside {smooth_nside}"
+    ratio = nside_in // smooth_nside
+    assert ratio & (ratio - 1) == 0, f"nside_in / smooth_nside = {ratio} must be a power of 2"
+    downscale = ratio ** 2
+    parent_pix = indices_nside_in // downscale
+    smooth_indices = np.unique(parent_pix)
+    parent_output_idx = np.searchsorted(smooth_indices, parent_pix).astype(np.int32)
+    return smooth_indices, parent_output_idx
+
+
 def get_smoothing_kwargs(loss_function, msfm_conf, dlss_conf, net_conf, dir_base=None, mode="training"):
     """Build a dictionary of keyword arguments for the deepsphere.healpy_layers.HealpySmoothing layer.
 
@@ -81,6 +109,24 @@ def get_smoothing_kwargs(loss_function, msfm_conf, dlss_conf, net_conf, dir_base
         mask = mask_dict["maglim"]
     else:
         raise ValueError("At least one of with_lensing, with_clustering, or with_cross must be True")
+
+    smooth_nside = net_conf["network"].get("smooth_nside", None)
+    if smooth_nside is not None and smooth_nside < n_side:
+        smooth_indices, parent_output_idx = get_smooth_nside_indices(data_vec_pix, n_side, smooth_nside)
+        # downsample the per-channel mask to smooth_nside using per-parent averaging
+        n_pix_out = len(smooth_indices)
+        counts = np.bincount(parent_output_idx, minlength=n_pix_out).astype(np.float32)
+        mask_smooth = np.stack(
+            [np.bincount(parent_output_idx, weights=mask[:, c].astype(np.float32), minlength=n_pix_out) / counts
+             for c in range(mask.shape[1])],
+            axis=1,
+        ).astype(np.float32)
+        LOGGER.info(f"Downsampling smoothing from nside={n_side} to smooth_nside={smooth_nside}: "
+                    f"{len(data_vec_pix)} → {n_pix_out} pixels")
+    else:
+        smooth_nside = n_side
+        smooth_indices = data_vec_pix
+        mask_smooth = mask
 
     try:
         fwhm = []
@@ -121,6 +167,9 @@ def get_smoothing_kwargs(loss_function, msfm_conf, dlss_conf, net_conf, dir_base
         if dlss_conf["dset"]["common"]["apply_norm"]:
             white_noise_sigma = np.array(white_noise_sigma) / np.array(map_normalization)
 
+        # scale white noise for lower nside: sigma ∝ 1/sqrt(pixel_area) ∝ nside
+        white_noise_sigma = np.array(white_noise_sigma) * (smooth_nside / n_side)
+
         # net
         if mode == "training":
             if loss_function == "delta":
@@ -136,10 +185,10 @@ def get_smoothing_kwargs(loss_function, msfm_conf, dlss_conf, net_conf, dir_base
                 effective_local_batch_size = net_conf["dset"]["eval"]["grid"]["local_batch_size"]
 
         smoothing_kwargs = {
-            "nside": n_side,
-            "indices": data_vec_pix,
+            "nside": smooth_nside,
+            "indices": smooth_indices,
             "nest": True,
-            "mask": mask,
+            "mask": mask_smooth,
             "fwhm": fwhm,
             "arcmin": arcmin,
             "n_sigma_support": n_sigma_support,
