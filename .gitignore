@@ -9,6 +9,7 @@ checkpoint/
 base_checkpoint/
 summary/
 logs/
+slurm/
 .env_var
 
 # Mac specific

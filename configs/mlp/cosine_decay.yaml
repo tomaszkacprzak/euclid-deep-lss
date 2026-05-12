@@ -8,7 +8,7 @@ activation: relu
 # Training
 n_steps: 500000
 batch_size: 1024
-learning_rate: 1e-4
+learning_rate: 1e-3
 clip_by_global_norm: 1.0
 
 # Learning rate schedule: cosine decay with optional linear warmup
@@ -29,6 +29,6 @@ xla: true
 
 # Early stopping (patience counts vali evaluations without improvement)
 early_stopping:
-  patience: 5 # stop after 5 stale vali evals (= 50k steps at vali_every=10k)
+  patience: 10 # stop after 10 stale vali evals (= 100k steps at vali_every=10k)
   min_delta: 1e-2 # must improve by at least this much
   min_steps: 100000 # never stop before this many training steps
