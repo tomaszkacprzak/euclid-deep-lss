@@ -21,6 +21,7 @@ class GaussianMixtureModel:
         num_hidden_units=128,
         activation="relu",
         full_covariance=True,
+        diagonal_eps=1e-5,
     ):
         self.dim_theta = dim_theta
         self.dim_summary = dim_summary
@@ -29,6 +30,7 @@ class GaussianMixtureModel:
         self.num_hidden_units = num_hidden_units
         self.activation = activation
         self.full_covariance = full_covariance
+        self.diagonal_eps = diagonal_eps
 
         self.mixture_logits_net = self._build_network(output_size=num_components)
         self.loc_net = self._build_network(output_size=num_components * dim_theta)
@@ -62,7 +64,13 @@ class GaussianMixtureModel:
         if self.full_covariance:
             scale_tril = self.scale_net(summary)  # (batch_size, num_components * tril_size)
             scale_tril = tf.reshape(scale_tril, [-1, self.num_components, self.tril_size])
-            scale_tril = tfp.math.fill_triangular(scale_tril)
+            scale_tril = tfp.math.fill_triangular(scale_tril)  # [-1, K, D, D]
+            # Ensure strictly positive diagonal so the Cholesky factor is valid.
+            # Raw network output is unbounded; zero or negative diagonal causes log(|diag|) → -inf
+            # and a singular inverse → NaN loss → NaN gradients → corrupted weights.
+            scale_tril = tf.linalg.set_diag(
+                scale_tril, tf.nn.softplus(tf.linalg.diag_part(scale_tril)) + self.diagonal_eps
+            )
             scale_tril = tf.cast(tf.reshape(scale_tril, [-1, self.num_components, self.dim_theta, self.dim_theta]), tf.float32)
             component_distribution = tfd.MultivariateNormalTriL(loc=loc, scale_tril=scale_tril)
         else:

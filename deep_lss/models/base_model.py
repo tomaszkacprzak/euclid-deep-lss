@@ -890,6 +890,14 @@ class BaseModel(object):
         # if isinstance(self.strategy, tf.distribute.Strategy):
         #     gradients = tf.distribute.get_replica_context().all_reduce("MEAN", gradients)
 
+        # Safety net: replace NaN/Inf gradients with zeros so a single bad batch cannot corrupt the
+        # weights. This makes a NaN step a no-op (zero gradient update) instead of a catastrophic
+        # weight corruption. Works inside tf.function via element-wise tf.where.
+        gradients = [
+            tf.where(tf.math.is_finite(g), g, tf.zeros_like(g)) if g is not None else g
+            for g in gradients
+        ]
+
         # clip the gradients
         if clip_by_value is not None:
             gradients = [tf.clip_by_value(g, clip_by_value[0], clip_by_value[1]) for g in gradients]
