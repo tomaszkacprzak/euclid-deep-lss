@@ -1,6 +1,6 @@
 #!/bin/bash
 MAX_RUNS=3
-SCRIPT=training_single.sh
+SCRIPT=training.sh
 
 START_RUN=${1:-1}
 

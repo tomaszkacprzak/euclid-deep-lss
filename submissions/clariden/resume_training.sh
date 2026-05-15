@@ -15,12 +15,13 @@ STRATEGY="mirrored"
 LOSS="mutual_info"
 
 VERSION="v16"
-SUBVERSION="default"
+# SUBVERSION="default"
 # SUBVERSION="no_sc"
-# SUBVERSION="rot_in_place"
+SUBVERSION="rot_in_place"
 
 # MODEL="40Mpc"
-MODEL="v5"
+MODEL="v1"
+# MODEL="v5"
 
 # PROBE="lensing"
 PROBE="clustering"
