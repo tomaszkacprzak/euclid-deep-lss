@@ -75,7 +75,11 @@ sleep 30
 srun --environment=tensorflow --gpu-bind=none --output=""$LOG"_inference.log" \
     python $REPOS/y3-deep-lss/deep_lss/apps/run_evaluation.py \
         --dist_strategy="$STRATEGY" \
-        --grid_vali_tfr_pattern=$GRID_EVAL_TFR
+        --grid_vali_tfr_pattern=$GRID_EVAL_TFR \
+        --data_dir=$INPUT \
+        --include_grid \
+        --include_des \
+        --include_bench
 
 sleep 30
 

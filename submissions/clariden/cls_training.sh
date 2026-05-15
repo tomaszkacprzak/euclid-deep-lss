@@ -15,9 +15,9 @@ VERSION="v16"
 SUBVERSION="rot_in_place"
 PROBES=("lensing" "clustering" "2x2pt" "combined")
 
-MLP="short"
-VMIM="gmm_diag"
-MODEL_NAME="v5_short"
+MLP="weight_decay"
+VMIM="gmm"
+MODEL_NAME="v6"
 
 INPUT="$MYSCRATCH/deep_lss/data/$VERSION/$SUBVERSION"
 
@@ -41,7 +41,10 @@ for PROBE in "${PROBES[@]}"; do
             --vmim_config="$REPOS/y3-deep-lss/configs/vmim/${VMIM}.yaml" \
             --data_dir="$INPUT" \
             --out_dir="$OUTPUT" \
-            --model_name="$MODEL_NAME" &
+            --model_name="$MODEL_NAME" \
+            --include_grid \
+            --include_des \
+            --include_bench &
 done
 
 wait
