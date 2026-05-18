@@ -1,0 +1,30 @@
+dset:
+  common:
+    with_lensing: True
+    with_clustering: True
+    with_cross_z: True
+    with_cross_probe: True
+    apply_norm: True
+    return_maps: True
+    return_cls: False
+  training:
+    params: [ Om, s8, w0, Aia, n_Aia, bta, bg1, bg2, bg3, bg4 ]
+  eval:
+    fiducial:
+      params: []
+    grid:
+      params: [ Om, s8, w0, Aia, n_Aia, bta, bg1, bg2, bg3, bg4 ]
+
+scale_cuts:
+  n_sigma_support: 3
+  arcmin: True
+  lensing:
+    # 8 Mpc/h transverse comoving scale
+    theta_fwhm: [29.5, 20.1, 15.0, 12.6]
+    white_noise_sigma: [0.00031085, 0.00040528, 0.00049122, 0.0005176]
+    l_max: [589, 863, 1159, 1382]
+  clustering:
+    # 24 Mpc/h transverse comoving scale
+    theta_fwhm: [97.7, 66.7, 51.1, 42.8]
+    white_noise_sigma: [0.76915, 0.34872, 0.34284, 0.35957]
+    l_max: [178, 261, 340, 406]

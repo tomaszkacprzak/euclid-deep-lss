@@ -1,0 +1,23 @@
+dset:
+  common:
+    with_lensing: True
+    with_clustering: False
+    apply_norm: True
+    return_maps: True
+    return_cls: False
+  training:
+    params: [ Om, s8, w0, Aia, n_Aia, bta ]
+  eval:
+    fiducial:
+      params: []
+    grid:
+      params: [ Om, s8, w0, Aia, n_Aia, bta ]
+
+scale_cuts:
+  n_sigma_support: 3
+  arcmin: True
+  lensing:
+    # 14 Mpc/h transverse comoving scale
+    theta_fwhm: [51.6, 35.2, 26.2, 22.0]
+    white_noise_sigma: [0.00046533, 0.00063996, 0.00080566, 0.00084511]
+    l_max: [336, 493, 662, 789]

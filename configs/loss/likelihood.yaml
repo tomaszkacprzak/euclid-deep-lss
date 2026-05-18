@@ -1,0 +1,8 @@
+loss_function: likelihood
+
+likelihood_loss:
+  # regularization
+  lambda_tikhonov_init: 20.0
+  lambda_tikhonov_decay_steps: 3000
+  # misc
+  img_summary: False

@@ -1,0 +1,15 @@
+loss_function: delta
+
+delta_loss:
+  # regularization
+  force_params_value: 0.0
+  force_params_weight: 1.0
+  jac_weight: 100.0
+  jac_cond_weight: null
+  cov_loss: False
+  # numerical stability
+  use_log_det: True
+  tikhonov_regu: False
+  eps: 1e-32
+  # misc
+  img_summary: False

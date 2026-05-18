@@ -14,9 +14,6 @@ clip_by_global_norm: 1.0
 # Learning rate schedule
 lr_schedule: constant # no cosine decay; learning_rate is held fixed throughout
 
-# Mutual information loss
-mutual_info_estimator: variational
-full_covariance: true
 
 # Logging / checkpointing
 log_every: 100

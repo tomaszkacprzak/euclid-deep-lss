@@ -1,6 +1,6 @@
 # Network architecture
 num_hidden_units: 1024
-num_layers: 4
+num_layers: 2
 dropout_rate: 0.1
 normalization: layer
 activation: relu
@@ -9,11 +9,9 @@ activation: relu
 n_steps: 500000
 batch_size: 1024
 learning_rate: 1e-4
-weight_decay: 1e-3
 clip_by_global_norm: 1.0
 
-# Learning rate schedule
-lr_schedule: constant # no cosine decay; learning_rate is held fixed throughout
+lr_schedule: constant
 
 # Logging / checkpointing
 log_every: 100
