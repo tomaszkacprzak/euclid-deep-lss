@@ -14,7 +14,7 @@ import tensorflow as tf
 for gpu in tf.config.list_physical_devices("GPU"):
     tf.config.experimental.set_memory_growth(gpu, True)
 
-import os, argparse, warnings, yaml, wandb
+import os, argparse, warnings, yaml, wandb, numpy as np, h5py
 
 from msfm.utils import logger, files
 
@@ -81,6 +81,16 @@ def setup():
     parser.add_argument("--wandb_tags", nargs="+", type=str, default=None, help="tags for weights & biases")
     parser.add_argument("--wandb_notes", type=str, default=None, help="notes for weights & biases (longer than tags)")
 
+    # Individual observation evaluation flags (all default off)
+    parser.add_argument("--include_grid", action="store_true", help="write stride-spaced grid examples into obs/")
+    parser.add_argument("--n_grid_examples", type=int, default=4)
+    parser.add_argument("--include_des", action="store_true", help="evaluate DES Y3 catalogs")
+    parser.add_argument("--include_buzzard", action="store_true", help="evaluate Buzzard N-body realizations")
+    parser.add_argument("--buzzard_labels", nargs="+", default=["Buzzard_mean"])
+    parser.add_argument("--include_bench", action="store_true", help="evaluate benchmark simulations")
+    parser.add_argument("--bench_labels", nargs="+", default=["bench_bsc=rot", "bench_bsc=fit", "bench_bsc=0", "bench_bsc=1"])
+    parser.add_argument("--data_dir", type=str, default=None, help="base data directory (needed for --include_bench)")
+
     args, _ = parser.parse_known_args()
 
     logger.set_all_loggers_level(args.verbosity)
@@ -133,11 +143,12 @@ if __name__ == "__main__":
 
     smooth_nside = net_conf["network"].get("smooth_nside", None)
     if smooth_nside is not None and smooth_nside < n_side:
-        smooth_indices, _ = configuration.get_smooth_nside_indices(data_vec_pix, n_side, smooth_nside)
+        smooth_indices, parent_output_idx = configuration.get_smooth_nside_indices(data_vec_pix, n_side, smooth_nside)
         LOGGER.info(f"Using smooth_nside={smooth_nside}: {len(data_vec_pix)} → {len(smooth_indices)} pixels")
     else:
         smooth_nside = n_side
         smooth_indices = data_vec_pix
+        parent_output_idx = None
 
     n_z_bins = 0
     if dlss_conf["dset"]["common"]["with_lensing"]:
@@ -202,6 +213,21 @@ if __name__ == "__main__":
             strategy=strategy,
         )
 
+    # Build a numpy-level model callable for individual observation evaluation.
+    # Includes downsampling when smooth_nside < n_side.
+    if parent_output_idx is not None:
+        _n_pix_out = len(smooth_indices)
+        _counts = np.bincount(parent_output_idx, minlength=_n_pix_out).astype(np.float32)
+
+        def _downsample(maps):
+            result = np.zeros((maps.shape[0], _n_pix_out, maps.shape[2]), dtype=maps.dtype)
+            np.add.at(result, (slice(None), parent_output_idx, slice(None)), maps)
+            return result / _counts[np.newaxis, :, np.newaxis]
+
+        model_fn = lambda x: model(_downsample(x), training=False).numpy()
+    else:
+        model_fn = lambda x: model(x, training=False).numpy()
+
     def evaluate_current_checkpoint(model):
         train_step = model.get_step()
 
@@ -256,6 +282,28 @@ if __name__ == "__main__":
             )
         else:
             LOGGER.warning(f"Skipping evaluation of the grid set")
+
+        # Individual observation evaluation (written into obs/ section of the same HDF5)
+        if out_file is not None:
+            if args.include_grid:
+                with h5py.File(out_file, "r") as _f:
+                    _gp = _f["grid/preds/test"][:]
+                    _gc = _f["grid/cosmos/test"][:]
+                if _gp.ndim == 3:
+                    _gp = np.concatenate(_gp, axis=0)
+                    _gc = np.concatenate(_gc, axis=0)
+                evaluation.evaluate_obs_grid(out_file, _gp, _gc, msfm_conf, args.n_grid_examples)
+
+            if args.include_des:
+                evaluation.evaluate_obs_des(model_fn, out_file, msfm_conf, dlss_conf)
+
+            if args.include_buzzard:
+                evaluation.evaluate_obs_buzzard(model_fn, out_file, msfm_conf, dlss_conf, args.buzzard_labels)
+
+            if args.include_bench:
+                evaluation.evaluate_obs_benchmark(
+                    model_fn, out_file, msfm_conf, dlss_conf, args.data_dir, args.bench_labels
+                )
 
         if args.wandb and out_file is not None:
             LOGGER.info(f"Logged the predictions to weights & biases")

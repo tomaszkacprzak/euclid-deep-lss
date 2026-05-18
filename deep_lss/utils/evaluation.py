@@ -413,6 +413,119 @@ def append_obs_to_file(pred_file, label, pred):
         print(f"wrote {label} of shape {pred.shape}")
 
 
+def evaluate_obs_grid(pred_file, grid_preds, grid_cosmos, msfm_conf, n_examples=4):
+    """Write stride-spaced grid examples from already-computed arrays into the obs/ section."""
+    stride = (
+        msfm_conf["analysis"]["grid"].get("n_perms_per_cosmo", 1)
+        * msfm_conf["analysis"].get("n_patches", 1)
+    )
+    for i in range(n_examples):
+        idx = i * stride
+        append_obs_to_file(pred_file, f"obs/preds/grid_{idx}", grid_preds[idx])
+        append_obs_to_file(pred_file, f"obs/cosmos/grid_{idx}", grid_cosmos[idx])
+
+
+def evaluate_obs_des(model_fn, pred_file, msfm_conf, dlss_conf):
+    """Evaluate real DES Y3 catalogs through the network, with and without systematics."""
+    from msfm.utils import catalog, observation
+
+    with_lensing = dlss_conf["dset"]["common"]["with_lensing"]
+    with_clustering = dlss_conf["dset"]["common"]["with_clustering"]
+
+    wl_map = catalog.build_metacal_map_from_cat(msfm_conf) if with_lensing else None
+    gc_map = catalog.build_maglim_map_from_cat(msfm_conf) if with_clustering else None
+
+    for apply_sys, label in [(True, "DESy3"), (False, "DESy3_no_sys")]:
+        des_dv, _, _ = observation.forward_model_observation_map(
+            wl_gamma_map=wl_map,
+            gc_count_map=gc_map,
+            conf=msfm_conf,
+            apply_norm=True,
+            with_padding=True,
+            nest_in=False,
+            apply_maglim_sys_map=apply_sys,
+        )
+        pred = model_fn(des_dv[np.newaxis])
+        append_obs_to_file(pred_file, f"obs/preds/{label}", pred)
+
+
+def evaluate_obs_buzzard(model_fn, pred_file, msfm_conf, dlss_conf, labels):
+    """Evaluate Buzzard N-body simulation realizations through the network."""
+    from msfm.utils import buzzard, observation
+
+    with_lensing = dlss_conf["dset"]["common"]["with_lensing"]
+    with_clustering = dlss_conf["dset"]["common"]["with_clustering"]
+
+    buzzard_indices, lensing_files, clustering_files = buzzard.get_filenames(msfm_conf)
+
+    for i, lensing_file, clustering_file in zip(buzzard_indices, lensing_files, clustering_files):
+        label = f"Buzzard_{i}"
+        if label not in labels:
+            continue
+        wl_map = buzzard.get_lensing_map(lensing_file) if with_lensing else None
+        gc_map = buzzard.get_clustering_map(clustering_file) if with_clustering else None
+        obs_map, _, _ = observation.forward_model_observation_map(
+            wl_gamma_map=wl_map,
+            gc_count_map=gc_map,
+            conf=msfm_conf,
+            apply_norm=True,
+            with_padding=True,
+            nest_in=False,
+        )
+        pred = model_fn(obs_map[np.newaxis])
+        append_obs_to_file(pred_file, f"obs/preds/{label}", pred)
+
+
+def evaluate_obs_benchmark(model_fn, pred_file, msfm_conf, dlss_conf, data_dir, obs_labels):
+    """Evaluate benchmark simulations from data_dir/obs/.
+
+    Writes obs/preds/{label}_stack (all realizations) and obs/preds/{label}_mean to pred_file,
+    and obs/cosmos/{label} containing the fiducial cosmology.
+    """
+    from msfm.utils import parameters
+
+    with_lensing = dlss_conf["dset"]["common"]["with_lensing"]
+    with_clustering = dlss_conf["dset"]["common"]["with_clustering"]
+    n_z_lensing = len(msfm_conf["survey"]["metacal"]["z_bins"]) if with_lensing else 0
+
+    norm_lensing = msfm_conf["analysis"]["normalization"]["lensing"]
+    norm_clustering = msfm_conf["analysis"]["normalization"]["clustering"]
+
+    target_params = dlss_conf["dset"]["training"]["params"]
+    fiducial_cosmo = parameters.get_fiducials(target_params, msfm_conf)
+
+    obs_dir = os.path.join(data_dir, "obs")
+
+    for label in obs_labels:
+        obs_file = os.path.join(obs_dir, f"{label}.h5")
+        if not os.path.exists(obs_file):
+            LOGGER.warning(f"Benchmark file not found: {obs_file}, skipping.")
+            continue
+
+        with h5py.File(obs_file, "r") as f:
+            obs_maps = f["obs/maps"][:].astype(np.float32)
+
+        # Select and normalise channels based on probe
+        n_channels_total = obs_maps.shape[-1]
+        if n_channels_total > n_z_lensing and with_lensing and not with_clustering:
+            obs_maps = obs_maps[:, :, :n_z_lensing]
+            obs_maps /= norm_lensing
+        elif n_channels_total > n_z_lensing and with_clustering and not with_lensing:
+            obs_maps = obs_maps[:, :, n_z_lensing:]
+            obs_maps /= norm_clustering
+        else:
+            if with_lensing:
+                obs_maps[:, :, :n_z_lensing] /= norm_lensing
+            if with_clustering:
+                obs_maps[:, :, n_z_lensing:] /= norm_clustering
+
+        preds = np.concatenate([model_fn(obs_maps[i : i + 1]) for i in range(len(obs_maps))], axis=0)
+
+        append_obs_to_file(pred_file, f"obs/preds/{label}_stack", preds)
+        append_obs_to_file(pred_file, f"obs/preds/{label}_mean", np.mean(preds, axis=0))
+        append_obs_to_file(pred_file, f"obs/cosmos/{label}", fiducial_cosmo)
+
+
 def plot_summary_space_prior_predictive(grid_preds, obs_pred, n_rand=1_000, np_seed=12):
     rng = np.random.default_rng(np_seed)
 
