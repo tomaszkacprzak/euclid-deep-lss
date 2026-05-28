@@ -1,6 +1,5 @@
 import argparse, h5py, os, yaml
 import numpy as np
-import matplotlib.pyplot as plt
 import tensorflow as tf
 
 for gpu in tf.config.list_physical_devices(device_type="GPU"):
@@ -11,8 +10,8 @@ from tqdm import tqdm
 from msfm.utils import files
 
 from deep_lss.models.grid_model import GridLossModel
-from deep_lss.nets.mlp import MultiLayerPerceptron
-from deep_lss.utils import evaluation
+from deep_lss.nets.mlp import MultiLayerPerceptron, PCAWhiteningLayer
+from deep_lss.utils import cls_evaluation, evaluation
 from deep_lss.utils.mutual_info_loss import distance_correlation
 
 from msi.utils import dataset, preprocessing
@@ -51,10 +50,15 @@ def setup():
     parser.add_argument("--out_dir", required=True)
     parser.add_argument("--model_name", default="model")
     parser.add_argument("--restore_checkpoint", action="store_true")
+    parser.add_argument(
+        "--hard_cut",
+        action="store_true",
+        help="Use hard ℓ-bin truncation instead of Gaussian smoothing + white noise scale cuts.",
+    )
 
     # Observation inclusion flags (all default off)
     parser.add_argument("--include_grid", action="store_true")
-    parser.add_argument("--n_grid_examples", type=int, default=16)
+    parser.add_argument("--n_grid_examples", type=int, default=4)
     parser.add_argument("--include_des", action="store_true")
     parser.add_argument("--include_bench", action="store_true")
 
@@ -110,7 +114,11 @@ def main():
     with open(os.path.join(pred_dir, "configs.yaml"), "w") as f:
         yaml.dump_all([mlp_conf, vmim_conf, dlss_conf, msfm_conf], f)
 
-    cl_dset_train, cl_dset_test, out_dict = dataset.get_binned_power_spectra_dset(
+    apply_log = mlp_conf.get("apply_log", True)
+    ell_weighting = mlp_conf.get("ell_weighting", None)
+
+    _dset_fn = dataset.get_binned_power_spectra_dset_hard_cut if args.hard_cut else dataset.get_binned_power_spectra_dset
+    cl_dset_train, cl_dset_test, out_dict = _dset_fn(
         args.data_dir,
         msfm_conf=msfm_conf,
         dlss_conf=dlss_conf,
@@ -121,11 +129,26 @@ def main():
         with_cross_probe=with_cross_probe,
         ggl_only=ggl_only,
         batch_size=batch_size,
-        apply_log=True,
+        apply_log=apply_log,
         standardize=False,
+        ell_weighting=ell_weighting,
     )
 
     n_cls = out_dict["grid/cls/train"].shape[-1]
+
+    n_pca = mlp_conf.get("pca_components", None)
+    if n_pca is not None:
+        pca_whiten = mlp_conf.get("pca_whiten", True)
+        whitening_layer = PCAWhiteningLayer(n_components=n_pca, whiten=pca_whiten)
+        if apply_log:
+            pca_fit_data = out_dict["grid/cls/train"]
+        else:
+            pca_fit_data = out_dict["grid/cls_raw/train"].copy()
+            if ell_weighting is not None and out_dict.get("ell_weights") is not None:
+                pca_fit_data = pca_fit_data * out_dict["ell_weights"].astype(pca_fit_data.dtype)
+        whitening_layer.fit(pca_fit_data)
+    else:
+        whitening_layer = None
 
     summary_net = MultiLayerPerceptron(
         output_size=n_summary,
@@ -134,6 +157,7 @@ def main():
         dropout_rate=mlp_conf["dropout_rate"],
         normalization=mlp_conf.get("normalization", "layer"),
         activation=mlp_conf.get("activation", "relu"),
+        whitening=whitening_layer,
     )
     summary_net.build((None, n_cls))
     summary_net.summary()
@@ -202,8 +226,14 @@ def main():
         else None
     )
 
-    # --- test-set tensors (noiseless log-Cls) for DC evaluation during training ---
-    cls_test_dc = np.array(out_dict["grid/cls/test"], dtype=np.float32)
+    # --- test-set tensors for DC evaluation — must match the training preprocessing ---
+    # grid/cls/test is already log-transformed; grid/cls_raw/test is linear.
+    if apply_log:
+        cls_test_dc = np.array(out_dict["grid/cls/test"], dtype=np.float32)
+    else:
+        cls_test_dc = np.array(out_dict["grid/cls_raw/test"], dtype=np.float32)
+        if ell_weighting is not None and out_dict.get("ell_weights") is not None:
+            cls_test_dc = cls_test_dc * out_dict["ell_weights"].astype(np.float32)
     grid_cosmos_dc = np.array(out_dict["grid/cosmos/test"], dtype=np.float32)
     _n_dc = min(2048, len(cls_test_dc))
     cls_test_dc_tf = tf.constant(cls_test_dc[:_n_dc])
@@ -234,8 +264,7 @@ def main():
             vali_steps.append(i)
             vali_losses_history.append(vali_loss)
             dc_preds = tf.concat(
-                [model(cls_test_dc_tf[j : j + batch_size], training=False)
-                 for j in range(0, _n_dc, batch_size)],
+                [model(cls_test_dc_tf[j : j + batch_size], training=False) for j in range(0, _n_dc, batch_size)],
                 axis=0,
             )
             dc_val = float(distance_correlation(dc_preds, grid_cosmos_dc_tf, training=False).numpy())
@@ -263,7 +292,7 @@ def main():
     else:
         model.restore_model()
 
-    _save_loss_curve(
+    cls_evaluation.save_loss_curve(
         pred_dir=pred_dir,
         pred_file=pred_file,
         train_steps=train_steps,
@@ -276,7 +305,7 @@ def main():
 
     # --- evaluate on test set (directly from out_dict, matching the notebook) ---
     print("Evaluating on test set...")
-    cls_test = cls_test_dc  # already extracted above (noiseless log-Cls, full test set)
+    cls_test = cls_test_dc  # already extracted above with correct apply_log/ell_weighting
     grid_cosmos = grid_cosmos_dc
 
     grid_preds = np.concatenate(
@@ -293,28 +322,34 @@ def main():
 
     print(f"Saved {len(grid_preds)} test predictions to {pred_file}")
 
-    # --- named grid observations (one per unique cosmology from test set) ---
+    # --- named grid observations (example 0 per cosmology, labeled by simulation indices) ---
     if args.include_grid:
-        n_perms = msfm_conf["analysis"]["grid"].get("n_perms_per_cosmo", 1)
-        n_patches = msfm_conf["analysis"].get("n_patches", 1)
-        stride = n_perms * n_patches
-        n_grid_obs = args.n_grid_examples
+        obs_i_sobol  = out_dict["grid/obs/i_sobol"]
+        obs_i_signal = out_dict["grid/obs/i_signal"]
+        obs_i_noise  = out_dict["grid/obs/i_noise"]
+        obs_cls      = out_dict["grid/obs/cls"]
+        obs_cosmos   = out_dict["grid/obs/cosmos"]
+
+        n_grid_obs = min(args.n_grid_examples, len(obs_cls))
+        obs_preds = np.concatenate(
+            [
+                model(tf.constant(obs_cls[i : i + batch_size], dtype=tf.float32), training=False).numpy()
+                for i in range(0, n_grid_obs, batch_size)
+            ],
+            axis=0,
+        )[:n_grid_obs]
 
         for k in range(n_grid_obs):
-            i = k * stride
-            if i >= len(grid_preds):
-                print(f"Only {len(grid_preds)} test examples; stopping grid obs at k={k}")
-                break
-            obs_label = f"grid_{i}"
-            evaluation.append_obs_to_file(pred_file, f"obs/preds/{obs_label}", grid_preds[i])
-            evaluation.append_obs_to_file(pred_file, f"obs/cosmos/{obs_label}", grid_cosmos[i])
+            label = f"grid_({int(obs_i_sobol[k])},{int(obs_i_signal[k])},{int(obs_i_noise[k])})"
+            evaluation.append_obs_to_file(pred_file, f"obs/preds/{label}", obs_preds[k])
+            evaluation.append_obs_to_file(pred_file, f"obs/cosmos/{label}", obs_cosmos[k])
 
-        print(f"Saved {min(n_grid_obs, len(grid_preds) // stride)} grid observations")
+        print(f"Saved {n_grid_obs} grid observations")
 
     # --- benchmark fiducial observation ---
     if args.include_bench:
         try:
-            _evaluate_bench_fidu_cls(
+            cls_evaluation.evaluate_bench_fidu_cls(
                 model=model,
                 pred_file=pred_file,
                 data_dir=args.data_dir,
@@ -327,6 +362,9 @@ def main():
                 with_cross_z=with_cross_z,
                 with_cross_probe=with_cross_probe,
                 ggl_only=ggl_only,
+                apply_log=apply_log,
+                ell_weighting=ell_weighting,
+                hard_cut=args.hard_cut,
             )
         except Exception as e:
             print(f"WARNING: bench_fidu evaluation failed ({e}), skipping")
@@ -334,7 +372,7 @@ def main():
     # --- DES Y3 real-data observation ---
     if args.include_des:
         try:
-            _evaluate_des_y3(
+            cls_evaluation.evaluate_des_y3(
                 model=model,
                 msfm_conf=msfm_conf,
                 dlss_conf=dlss_conf,
@@ -345,174 +383,12 @@ def main():
                 with_cross_z=with_cross_z,
                 with_cross_probe=with_cross_probe,
                 ggl_only=ggl_only,
+                apply_log=apply_log,
+                ell_weighting=ell_weighting,
+                hard_cut=args.hard_cut,
             )
         except Exception as e:
             print(f"WARNING: DES Y3 evaluation failed ({e}), skipping")
-
-
-def _evaluate_bench_fidu_cls(
-    model,
-    pred_file,
-    data_dir,
-    msfm_conf,
-    dlss_conf,
-    params,
-    batch_size,
-    with_lensing,
-    with_clustering,
-    with_cross_z,
-    with_cross_probe,
-    ggl_only,
-):
-    from msfm.utils import parameters as msfm_params
-
-    print("Evaluating bench_fidu...")
-    obs_file = os.path.join(data_dir, "obs", "fiducial_bench_obs_maps.h5")
-    with h5py.File(obs_file, "r") as f_in:
-        obs_cls_raw = f_in["obs/cls_raw"][:]
-    print(f"obs_cls_raw.shape = {obs_cls_raw.shape}")
-
-    obs_cl = preprocessing.get_preprocessed_cl_observation(
-        obs_cl=obs_cls_raw,
-        msfm_conf=msfm_conf,
-        dlss_conf=dlss_conf,
-        base_dir=data_dir,
-        nest_in=False,
-        with_lensing=with_lensing,
-        with_clustering=with_clustering,
-        with_cross_z=with_cross_z,
-        with_cross_probe=with_cross_probe,
-        ggl_only=ggl_only,
-        apply_log=True,
-        standardize=False,
-        make_plot=False,
-    )
-    obs_cl = np.squeeze(obs_cl)
-
-    fidu_preds = np.concatenate(
-        [
-            model(tf.constant(obs_cl[i : i + batch_size], dtype=tf.float32), training=False).numpy()
-            for i in range(0, len(obs_cl), batch_size)
-        ],
-        axis=0,
-    )
-
-    fiducial_cosmo = msfm_params.get_fiducials(params, msfm_conf)
-
-    evaluation.append_obs_to_file(pred_file, "obs/preds/bench_fidu_stack", fidu_preds)
-    evaluation.append_obs_to_file(pred_file, "obs/preds/bench_fidu_mean", np.mean(fidu_preds, axis=0))
-    evaluation.append_obs_to_file(pred_file, "obs/cosmos/bench_fidu", fiducial_cosmo)
-    print(f"Saved bench_fidu ({len(fidu_preds)} realizations) to {pred_file}")
-
-
-def _save_loss_curve(pred_dir, pred_file, train_steps, train_losses, vali_steps, vali_losses, log_every, vali_dc=None):
-    train_steps = np.array(train_steps)
-    train_losses = np.array(train_losses)
-    vali_steps = np.array(vali_steps)
-    vali_losses = np.array(vali_losses)
-    vali_dc = np.array(vali_dc) if vali_dc else np.array([])
-
-    with h5py.File(pred_file, "a") as f:
-        for key, arr in [
-            ("loss/train_steps", train_steps),
-            ("loss/train_losses", train_losses),
-            ("loss/vali_steps", vali_steps),
-            ("loss/vali_losses", vali_losses),
-            ("loss/vali_dc", vali_dc),
-        ]:
-            if key in f:
-                del f[key]
-            f.create_dataset(key, data=arr)
-
-    has_vali = len(vali_steps) > 0
-    has_dc = len(vali_dc) > 0
-    n_panels = 1 + int(has_dc)
-    fig, axes = plt.subplots(1, n_panels, figsize=(8 * n_panels, 4))
-    if n_panels == 1:
-        axes = [axes]
-
-    skip = max(1, 1000 // log_every)
-    ax = axes[0]
-    ax.plot(train_steps[skip:], train_losses[skip:], lw=0.8, label="train")
-    if has_vali:
-        ax.plot(vali_steps, vali_losses, lw=1.5, marker="o", ms=3, label="vali")
-    ax.set_xlabel("step")
-    ax.set_ylabel("MI loss")
-    ax.legend()
-
-    if has_dc:
-        ax2 = axes[1]
-        ax2.plot(vali_steps, vali_dc, lw=1.5, marker="o", ms=3, color="C2", label="vali DC")
-        ax2.set_xlabel("step")
-        ax2.set_ylabel("distance correlation (lower = more correlated)")
-        ax2.legend()
-
-    fig.tight_layout()
-    fig.savefig(os.path.join(pred_dir, "loss_curve.png"), dpi=150)
-    plt.close(fig)
-    print(f"Saved loss curve to {pred_dir}/loss_curve.png")
-
-
-def _evaluate_des_y3(
-    model,
-    msfm_conf,
-    dlss_conf,
-    data_dir,
-    pred_file,
-    with_lensing,
-    with_clustering,
-    with_cross_z,
-    with_cross_probe,
-    ggl_only=False,
-):
-    from msfm.utils import catalog
-
-    print("Building DES Y3 maps from catalogs...")
-    wl_gamma_map, _ = catalog.build_metacal_map_from_cat(msfm_conf)
-    gc_count_map = catalog.build_maglim_map_from_cat(msfm_conf)
-
-    print("Computing DES Y3 binned Cls...")
-    des_cl = preprocessing.get_preprocessed_cl_observation(
-        wl_gamma_map=wl_gamma_map,
-        gc_count_map=gc_count_map,
-        msfm_conf=msfm_conf,
-        dlss_conf=dlss_conf,
-        base_dir=data_dir,
-        nest_in=False,
-        with_lensing=with_lensing,
-        with_clustering=with_clustering,
-        with_cross_z=with_cross_z,
-        with_cross_probe=with_cross_probe,
-        ggl_only=ggl_only,
-        apply_log=True,
-        standardize=False,
-        make_plot=False,
-        apply_maglim_sys_map=True,
-    )
-
-    des_pred = model(tf.constant(des_cl, dtype=tf.float32), training=False).numpy()
-    evaluation.append_obs_to_file(pred_file, "obs/preds/DESy3", des_pred)
-
-    # des_cl = preprocessing.get_preprocessed_cl_observation(
-    #     wl_gamma_map=wl_gamma_map,
-    #     gc_count_map=gc_count_map,
-    #     msfm_conf=msfm_conf,
-    #     dlss_conf=dlss_conf,
-    #     base_dir=data_dir,
-    #     nest_in=False,
-    #     with_lensing=with_lensing,
-    #     with_clustering=with_clustering,
-    #     with_cross_z=with_cross_z,
-    #     with_cross_probe=with_cross_probe,
-    #     apply_log=True,
-    #     standardize=False,
-    #     make_plot=False,
-    #     apply_maglim_sys_map=False,
-    # )
-
-    # des_pred = model(tf.constant(des_cl, dtype=tf.float32), training=False).numpy()
-    # evaluation.append_obs_to_file(pred_file, "obs/preds/DESy3_no_sys", des_pred)
-    # print("Saved DES Y3 prediction")
 
 
 if __name__ == "__main__":
