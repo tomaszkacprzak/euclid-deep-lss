@@ -287,12 +287,18 @@ if __name__ == "__main__":
         if out_file is not None:
             if args.include_grid:
                 with h5py.File(out_file, "r") as _f:
-                    _gp = _f["grid/preds/test"][:]
-                    _gc = _f["grid/cosmos/test"][:]
+                    _gp   = _f["grid/preds/test"][:]
+                    _gc   = _f["grid/cosmos/test"][:]
+                    _isob = _f["grid/i_sobol/test"][:]
+                    _isig = _f["grid/i_signal/test"][:]
+                    _inoi = _f["grid/i_noise/test"][:]
                 if _gp.ndim == 3:
-                    _gp = np.concatenate(_gp, axis=0)
-                    _gc = np.concatenate(_gc, axis=0)
-                evaluation.evaluate_obs_grid(out_file, _gp, _gc, msfm_conf, args.n_grid_examples)
+                    _gp   = np.concatenate(_gp,   axis=0)
+                    _gc   = np.concatenate(_gc,   axis=0)
+                    _isob = np.concatenate(_isob, axis=0)
+                    _isig = np.concatenate(_isig, axis=0)
+                    _inoi = np.concatenate(_inoi, axis=0)
+                evaluation.evaluate_obs_grid(out_file, _gp, _gc, _isob, _isig, _inoi, args.n_grid_examples)
 
             if args.include_des:
                 evaluation.evaluate_obs_des(model_fn, out_file, msfm_conf, dlss_conf)

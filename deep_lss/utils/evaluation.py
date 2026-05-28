@@ -217,6 +217,12 @@ def evaluate_grid(
 
     def write_out_file():
         with h5py.File(out_file, "a") as f:
+            keys = ["grid/preds/test", "grid/cosmos/test", "grid/i_sobol/test", "grid/i_signal/test", "grid/i_noise/test"]
+            if save_second_to_last_layer:
+                keys.append("grid/second_to_last_layer/test")
+            for key in keys:
+                if key in f:
+                    del f[key]
             f.create_dataset(name="grid/preds/test", data=preds)
             f.create_dataset(name="grid/cosmos/test", data=cosmos)
             f.create_dataset(name="grid/i_sobol/test", data=i_sobols)
@@ -374,12 +380,24 @@ def evaluate_fiducial(
     def write_out_file():
         with h5py.File(out_file, "a") as f:
             if training_set:
+                keys = ["fiducial/train/pred", "fiducial/train/i_example", "fiducial/train/i_noise"]
+                if save_second_to_last_layer:
+                    keys.append("fiducial/train/second_to_last_layer")
+                for key in keys:
+                    if key in f:
+                        del f[key]
                 f.create_dataset(name="fiducial/train/pred", data=preds)
                 f.create_dataset(name="fiducial/train/i_example", data=i_examples)
                 f.create_dataset(name="fiducial/train/i_noise", data=i_noises)
                 if save_second_to_last_layer:
                     f.create_dataset(name="fiducial/train/second_to_last_layer", data=second_to_last_layer)
             else:
+                keys = ["fiducial/vali/pred", "fiducial/vali/i_example", "fiducial/vali/i_noise"]
+                if save_second_to_last_layer:
+                    keys.append("fiducial/vali/second_to_last_layer")
+                for key in keys:
+                    if key in f:
+                        del f[key]
                 f.create_dataset(name="fiducial/vali/pred", data=preds)
                 f.create_dataset(name="fiducial/vali/i_example", data=i_examples)
                 f.create_dataset(name="fiducial/vali/i_noise", data=i_noises)
@@ -413,16 +431,13 @@ def append_obs_to_file(pred_file, label, pred):
         print(f"wrote {label} of shape {pred.shape}")
 
 
-def evaluate_obs_grid(pred_file, grid_preds, grid_cosmos, msfm_conf, n_examples=4):
-    """Write stride-spaced grid examples from already-computed arrays into the obs/ section."""
-    stride = (
-        msfm_conf["analysis"]["grid"].get("n_perms_per_cosmo", 1)
-        * msfm_conf["analysis"].get("n_patches", 1)
-    )
-    for i in range(n_examples):
-        idx = i * stride
-        append_obs_to_file(pred_file, f"obs/preds/grid_{idx}", grid_preds[idx])
-        append_obs_to_file(pred_file, f"obs/cosmos/grid_{idx}", grid_cosmos[idx])
+def evaluate_obs_grid(pred_file, grid_preds, grid_cosmos, i_sobols, i_signals, i_noises, n_examples=4):
+    """Write one example per unique cosmology into the obs/ section, labeled by (i_sobol,i_signal,i_noise)."""
+    _, first_indices = np.unique(i_sobols, return_index=True)
+    for idx in first_indices[:n_examples]:
+        label = f"grid_({int(i_sobols[idx])},{int(i_signals[idx])},{int(i_noises[idx])})"
+        append_obs_to_file(pred_file, f"obs/preds/{label}", grid_preds[idx])
+        append_obs_to_file(pred_file, f"obs/cosmos/{label}", grid_cosmos[idx])
 
 
 def evaluate_obs_des(model_fn, pred_file, msfm_conf, dlss_conf):
@@ -432,7 +447,7 @@ def evaluate_obs_des(model_fn, pred_file, msfm_conf, dlss_conf):
     with_lensing = dlss_conf["dset"]["common"]["with_lensing"]
     with_clustering = dlss_conf["dset"]["common"]["with_clustering"]
 
-    wl_map = catalog.build_metacal_map_from_cat(msfm_conf) if with_lensing else None
+    wl_map = catalog.build_metacal_map_from_cat(msfm_conf)[0] if with_lensing else None
     gc_map = catalog.build_maglim_map_from_cat(msfm_conf) if with_clustering else None
 
     for apply_sys, label in [(True, "DESy3"), (False, "DESy3_no_sys")]:
