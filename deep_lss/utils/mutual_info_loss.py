@@ -15,6 +15,7 @@ import tensorflow as tf
 
 from deep_lss.nets.mlp import MultiLayerPerceptron
 from deep_lss.nets.gaussian_mixture import GaussianMixtureModel
+from deep_lss.nets.normalizing_flow import NormalizingFlowModel
 
 # Jensen-Shannon-divergence estimator #################################################################################
 
@@ -149,25 +150,46 @@ def get_variational_model_from_net(
 def get_variational_model_from_summary(
     dim_summary,
     dim_theta,
+    density_estimator="gmm",
+    # GMM-specific
     num_components=4,
+    full_covariance=True,
+    # shared
     num_hidden_layers=2,
     num_hidden_units=128,
     activation="relu",
-    full_covariance=True,
+    # flow-specific
+    num_layers=4,
+    scale_eps=1e-5,
+    log_scale_clip=5.0,
 ):
-    gmm = GaussianMixtureModel(
-        dim_theta=dim_theta,
-        dim_summary=dim_summary,
-        num_components=num_components,
-        num_hidden_layers=num_hidden_layers,
-        num_hidden_units=num_hidden_units,
-        activation=activation,
-        full_covariance=full_covariance,
-    )
+    if density_estimator == "gmm":
+        estimator = GaussianMixtureModel(
+            dim_theta=dim_theta,
+            dim_summary=dim_summary,
+            num_components=num_components,
+            num_hidden_layers=num_hidden_layers,
+            num_hidden_units=num_hidden_units,
+            activation=activation,
+            full_covariance=full_covariance,
+        )
+    elif density_estimator == "flow":
+        estimator = NormalizingFlowModel(
+            dim_theta=dim_theta,
+            dim_summary=dim_summary,
+            num_layers=num_layers,
+            num_hidden_units=num_hidden_units,
+            num_hidden_layers=num_hidden_layers,
+            activation=activation,
+            scale_eps=scale_eps,
+            log_scale_clip=log_scale_clip,
+        )
+    else:
+        raise ValueError(f"Unknown density_estimator '{density_estimator}', choose 'gmm' or 'flow'")
 
     in_summary = tf.keras.Input(shape=(dim_summary,))
     in_theta = tf.keras.Input(shape=(dim_theta,))
 
-    out = -gmm.log_prob(in_theta, in_summary)
+    out = -estimator.log_prob(in_theta, in_summary)
 
     return tf.keras.Model(inputs=[in_summary, in_theta], outputs=out)
