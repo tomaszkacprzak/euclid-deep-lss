@@ -17,17 +17,17 @@ LOSS="mutual_info"
 FLOW_CONFIG="$REPOS/multiprobe-simulation-inference/configs/flow/default.yaml"
 
 VERSION="v16"
-SUBVERSION="default"
+# SUBVERSION="default"
 # SUBVERSION="no_sc"
-# SUBVERSION="rot_in_place"
+SUBVERSION="rot_in_place"
 
 # MODEL="40Mpc"
-MODEL="v5"
+MODEL="v2"
 # MODEL="v1_inv"
 # MODEL="debug/v2"
 
-PROBE="lensing"
-# PROBE="clustering"
+# PROBE="lensing"
+PROBE="clustering"
 # PROBE="cross"
 # PROBE="combined"
 
@@ -61,14 +61,12 @@ srun --environment=tensorflow --gpu-bind=none --output=""$LOG"_training.log" \
         --train_tfr_pattern=$TRAIN_TFR \
         --grid_vali_tfr_pattern=$GRID_EVAL_TFR \
         --msfm_config="$REPOS/multiprobe-simulation-forward-model/configs/$VERSION/$SUBVERSION.yaml" \
-        --dlss_config="$REPOS/y3-deep-lss/configs/$VERSION/$SUBVERSION/$PROBE/scale_cuts/40Mpc.yaml" \
+        --dlss_config="$REPOS/y3-deep-lss/configs/$VERSION/$SUBVERSION/$PROBE/dlss.yaml" \
         --net_config="$REPOS/y3-deep-lss/configs/$VERSION/$SUBVERSION/$PROBE/deepsphere_256.yaml" \
         --dist_strategy="$STRATEGY" \
         --wandb \
         --wandb_tags "$VERSION" "$SUBVERSION" "$PROBE" "$LOSS" "$STRATEGY" "resnet" \
         $RESTORE_FLAG
-        # --dlss_config="$REPOS/y3-deep-lss/configs/$VERSION/$SUBVERSION/$PROBE/dlss.yaml" \
-        # --net_config="$REPOS/y3-deep-lss/configs/$VERSION/$SUBVERSION/$PROBE/deepsphere_debug.yaml" \
 
 sleep 30
 

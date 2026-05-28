@@ -15,9 +15,19 @@ VERSION="v16"
 SUBVERSION="rot_in_place"
 PROBES=("lensing" "clustering" "2x2pt" "combined")
 
-MLP="weight_decay"
+MLP="small"
+# MLP="pca"
 VMIM="gmm"
-MODEL_NAME="v6"
+# MODEL_NAME="v11"
+MODEL_NAME="v12_hard"
+
+# Flags passed to run_cls_training+evaluation.py — comment out --hard_cut for standard variant
+TRAIN_FLAGS=(
+    --include_grid
+    --include_des
+    --include_bench
+    --hard_cut
+)
 
 INPUT="$MYSCRATCH/deep_lss/data/$VERSION/$SUBVERSION"
 
@@ -42,28 +52,26 @@ for PROBE in "${PROBES[@]}"; do
             --data_dir="$INPUT" \
             --out_dir="$OUTPUT" \
             --model_name="$MODEL_NAME" \
-            --include_grid \
-            --include_des \
-            --include_bench &
+            "${TRAIN_FLAGS[@]}" &
 done
 
 wait
+
+FLOW_CONFIG="$REPOS/multiprobe-simulation-inference/configs/flow/default.yaml"
 
 echo "Starting Inference..."
 
 for PROBE in "${PROBES[@]}"; do
     OUTPUT="$MYSCRATCH/deep_lss/runs/$VERSION/$SUBVERSION/cls/$PROBE"
-    DLSS_CONFIG="$REPOS/y3-deep-lss/configs/$VERSION/$SUBVERSION/$PROBE/dlss.yaml"
     LOG="$OUTPUT/$MODEL_NAME/logs/${SLURM_JOB_ID}"
 
     srun -N1 --ntasks-per-node=1 --exclusive --gpus-per-task=1 --cpus-per-gpu=72 --mem=110G \
         --uenv=pytorch/v2.9.1:v2 --view=default \
         --output="${LOG}_inference.log" \
-        bash -c "source ~/dlss/torch_env/bin/activate && python $REPOS/multiprobe-simulation-inference/msi/apps/run_cls_inference.py \
-            --msfm_config=\"$REPOS/multiprobe-simulation-forward-model/configs/$VERSION/$SUBVERSION.yaml\" \
-            --dlss_config=\"$DLSS_CONFIG\" \
+        bash -c "source ~/dlss/torch_env/bin/activate && python $REPOS/multiprobe-simulation-inference/msi/apps/run_inference.py \
             --out_dir=\"$OUTPUT\" \
             --model_name=\"$MODEL_NAME\" \
+            --flow_config=\"$FLOW_CONFIG\" \
             --include_grid \
             --include_des \
             --include_bench" &
