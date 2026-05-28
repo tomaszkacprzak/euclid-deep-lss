@@ -5,10 +5,79 @@ Created August 2024
 Author: Arne Thomsen
 """
 
+import numpy as np
 import tensorflow as tf
 from msfm.utils import logger
 
 LOGGER = logger.get_logger(__file__)
+
+
+class PCAWhiteningLayer(tf.keras.layers.Layer):
+    """Offline PCA whitening stored as non-trainable weights inside the TF checkpoint.
+
+    Call fit() once on the training data (numpy array) before the training loop.
+    The fitted mean and projection matrix are saved with the model checkpoint and
+    restored automatically at inference time — no separate file needed.
+
+    Output dimension is n_components (< input dimension if truncated), with each
+    component having zero mean and unit variance over the training distribution.
+    LayerNorm is redundant after this layer and should be disabled in the MLP.
+    """
+
+    def __init__(self, n_components, whiten=True, eps=1e-8, **kwargs):
+        super().__init__(**kwargs)
+        self.n_components = n_components
+        self.whiten = whiten
+        self.eps = eps
+
+    def build(self, input_shape):
+        n_in = input_shape[-1]
+        n_out = min(self.n_components, n_in)
+        self.mean_ = self.add_weight("mean", shape=(n_in,), trainable=False, initializer="zeros")
+        self.components_ = self.add_weight("components", shape=(n_in, n_out), trainable=False, initializer="zeros")
+        super().build(input_shape)
+
+    def fit(self, x, max_samples=200_000):
+        """Compute PCA whitening statistics from a (N, n_in) numpy array.
+
+        Subsamples to max_samples rows so covariance estimation stays fast even
+        when the full training set is large. 200k samples is more than sufficient
+        to estimate an 800×800 covariance matrix accurately.
+        """
+        if not self.built:
+            self.build((None, x.shape[-1]))
+
+        rng = np.random.default_rng(0)
+        if x.shape[0] > max_samples:
+            idx = rng.choice(x.shape[0], size=max_samples, replace=False)
+            x = x[idx]
+
+        x = x.astype(np.float64)
+        mean = x.mean(axis=0)
+        cov = np.cov(x.T)
+
+        eigvals, eigvecs = np.linalg.eigh(cov)
+        # eigh returns ascending order — reverse to descending
+        idx = np.argsort(eigvals)[::-1][: self.n_components]
+        if self.whiten:
+            components = eigvecs[:, idx] / np.sqrt(eigvals[idx] + self.eps)
+        else:
+            components = eigvecs[:, idx]
+
+        explained = eigvals[np.argsort(eigvals)[::-1]][: self.n_components].sum() / eigvals.sum()
+        LOGGER.info(f"PCAWhiteningLayer: kept {self.n_components}/{x.shape[1]} components, "
+                    f"explained variance = {explained:.3f}")
+
+        self.mean_.assign(mean.astype(np.float32))
+        self.components_.assign(components.astype(np.float32))
+
+    def call(self, inputs):
+        return (inputs - self.mean_) @ self.components_
+
+    def get_config(self):
+        config = super().get_config()
+        config.update({"n_components": self.n_components, "whiten": self.whiten, "eps": self.eps})
+        return config
 
 
 class MultiLayerPerceptron(tf.keras.Model):
@@ -21,9 +90,18 @@ class MultiLayerPerceptron(tf.keras.Model):
         dropout_rate=0.0,
         normalization="layer",
         activation="relu",
+        whitening=None,
     ):
         super(MultiLayerPerceptron, self).__init__()
-        if normalization == "layer":
+
+        self.whitening = whitening
+        # Skip LayerNorm only when whitening already provides population-level unit variance
+        # (whiten=True). With whiten=False the PCA only rotates; eigenvalue spread can be
+        # huge, so LayerNorm is still needed to prevent activation explosion.
+        skip_norm = whitening is not None and whitening.whiten
+        if skip_norm:
+            self.norm_layer = None
+        elif normalization == "layer":
             self.norm_layer = tf.keras.layers.LayerNormalization()
         elif normalization == "batch":
             self.norm_layer = tf.keras.layers.BatchNormalization()
@@ -43,7 +121,9 @@ class MultiLayerPerceptron(tf.keras.Model):
         self.output_layer = tf.keras.layers.Dense(output_size, name="output")
 
     def call(self, inputs, training=False):
-        x = self.norm_layer(inputs)
+        x = self.whitening(inputs) if self.whitening is not None else inputs
+        if self.norm_layer is not None:
+            x = self.norm_layer(x)
         for layer in self.hidden_layers:
             x = layer(x, training=training)
         return self.output_layer(x)
