@@ -54,8 +54,8 @@ Configuration files for network architecture, loss function, and optimizer hyper
 Bash scripts for HPC `slurm` job scheduling.
 
 ## Companion Repositories
-- Forward modeling: [`multiprobe-simulation-forward-model`](https://github.com/des-science/multiprobe-simulation-forward-model)
-- Simulation-based inference: [`multiprobe-simulation-inference`](https://github.com/des-science/multiprobe-simulation-inference)
+- Forward modeling: [`euclid-multiprobe-simulation-forward-model`](https://github.com/tomaszkacprzak/euclid-multiprobe-simulation-forward-model/)
+- Simulation-based inference: [`euclid-multiprobe-simulation-inference`](https://github.com/tomaszkacprzak/euclid-multiprobe-simulation-inference/)
 
 ## [Platform for Advanced Scientific Computing (PASC) 2024](https://pasc24.pasc-conference.org/presentation/?id=pos117&sess=sess158)
 <a href="dev/figures/pasc_poster.png"><img src="dev/figures/pasc_poster.png" width="400" alt="PASC 2024 Poster"></a>
