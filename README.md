@@ -18,7 +18,7 @@ Requires Python >= 3.8, TensorFlow >= 2.0, TensorFlow-Probability, and Horovod.
 
 **Step 1: Install dependencies from GitHub**
 ```bash
-# Install multiprobe-simulation-forward-model (data loading)
+# Install euclid-multiprobe-simulation-forward-model (data loading)
 pip install git+https://github.com/tomaszkacprzak/euclid-multiprobe-simulation-forward-model.git
 
 # Install deepsphere-cosmo-tf2 (graph convolutional networks in TensorFlow 2)
