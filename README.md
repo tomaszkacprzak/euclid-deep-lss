@@ -13,7 +13,7 @@ This repository contains the pipeline to train neural networks that learn inform
 Requires Python >= 3.8, TensorFlow >= 2.0, TensorFlow-Probability, and Horovod.
 
 **Main dependencies:**
-- [`multiprobe-simulation-forward-model`](https://github.com/des-science/multiprobe-simulation-forward-model) for data loading and utilities
+- [`euclid-multiprobe-simulation-forward-model`](https://github.com/tomaszkacprzak/euclid-multiprobe-simulation-forward-model/) for data loading and utilities
 - [`deepsphere-cosmo-tf2`](https://github.com/deepsphere/deepsphere-cosmo-tf2) for graph convolutional neural networks on the pixelized sphere
 
 **Step 1: Install dependencies from GitHub**
