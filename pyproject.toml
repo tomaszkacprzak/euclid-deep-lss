@@ -34,6 +34,7 @@ dependencies = [
     "pyyaml",
     "wandb",
     "icecream",
+    "pandas>=2.2.3",
 ]
 
 [project.optional-dependencies]
