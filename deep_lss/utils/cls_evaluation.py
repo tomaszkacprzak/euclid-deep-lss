@@ -7,6 +7,7 @@ power spectra rather than pixel maps.
 """
 
 import os
+from functools import partial
 
 import h5py
 import matplotlib.pyplot as plt
@@ -16,13 +17,25 @@ import tensorflow as tf
 from deep_lss.utils import evaluation
 from msi.utils import preprocessing
 
+_OBS_PREPROC_FNS = {
+    "hard":             preprocessing.get_preprocessed_cl_observation_hard_cut,
+    "hard_conservative": partial(preprocessing.get_preprocessed_cl_observation_hard_cut, n_extra_bins=1),
+    "none":             preprocessing.get_preprocessed_cl_observation_hard_cut,
+    "soft_pruned":      partial(preprocessing.get_preprocessed_cl_observation, scale_cut="soft_pruned"),
+    "soft":             preprocessing.get_preprocessed_cl_observation,
+}
 
-def save_loss_curve(pred_dir, pred_file, train_steps, train_losses, vali_steps, vali_losses, log_every, vali_dc=None):
+
+def _obs_preprocessing_fn(scale_cut):
+    return _OBS_PREPROC_FNS[scale_cut]
+
+
+def save_loss_curve(pred_dir, pred_file, train_steps, train_losses, vali_steps, vali_losses, log_every, vali_mse=None):
     train_steps = np.array(train_steps)
     train_losses = np.array(train_losses)
     vali_steps = np.array(vali_steps)
     vali_losses = np.array(vali_losses)
-    vali_dc = np.array(vali_dc) if vali_dc else np.array([])
+    vali_mse = np.array(vali_mse) if vali_mse else np.array([])
 
     with h5py.File(pred_file, "a") as f:
         for key, arr in [
@@ -30,15 +43,15 @@ def save_loss_curve(pred_dir, pred_file, train_steps, train_losses, vali_steps, 
             ("loss/train_losses", train_losses),
             ("loss/vali_steps", vali_steps),
             ("loss/vali_losses", vali_losses),
-            ("loss/vali_dc", vali_dc),
+            ("loss/vali_mse", vali_mse),
         ]:
             if key in f:
                 del f[key]
             f.create_dataset(key, data=arr)
 
     has_vali = len(vali_steps) > 0
-    has_dc = len(vali_dc) > 0
-    n_panels = 1 + int(has_dc)
+    has_mse = len(vali_mse) > 0
+    n_panels = 1 + int(has_mse)
     fig, axes = plt.subplots(1, n_panels, figsize=(8 * n_panels, 4))
     if n_panels == 1:
         axes = [axes]
@@ -52,11 +65,11 @@ def save_loss_curve(pred_dir, pred_file, train_steps, train_losses, vali_steps, 
     ax.set_ylabel("MI loss")
     ax.legend()
 
-    if has_dc:
+    if has_mse:
         ax2 = axes[1]
-        ax2.plot(vali_steps, vali_dc, lw=1.5, marker="o", ms=3, color="C2", label="vali DC")
+        ax2.plot(vali_steps, vali_mse, lw=1.5, marker="o", ms=3, color="C2", label="vali MSE")
         ax2.set_xlabel("step")
-        ax2.set_ylabel("distance correlation (lower = more correlated)")
+        ax2.set_ylabel("posterior mean MSE")
         ax2.legend()
 
     fig.tight_layout()
@@ -65,7 +78,8 @@ def save_loss_curve(pred_dir, pred_file, train_steps, train_losses, vali_steps, 
     print(f"Saved loss curve to {pred_dir}/loss_curve.png")
 
 
-def evaluate_bench_fidu_cls(
+def evaluate_mock_cls(
+    label,
     model,
     pred_file,
     data_dir,
@@ -80,18 +94,21 @@ def evaluate_bench_fidu_cls(
     ggl_only,
     apply_log=True,
     ell_weighting=None,
-    hard_cut=False,
+    scale_cut="hard",
 ):
     from msfm.utils import parameters as msfm_params
 
-    print("Evaluating bench_fidu...")
-    obs_file = os.path.join(data_dir, "obs", "fiducial_bench_obs_maps.h5")
+    obs_file = os.path.join(data_dir, "obs", f"{label}_obs_maps.h5")
+    out_label = label
+    if not os.path.exists(obs_file):
+        print(f"WARNING: mock file not found: {obs_file}, skipping")
+        return
+    print(f"Evaluating {out_label}...")
     with h5py.File(obs_file, "r") as f_in:
         obs_cls_raw = f_in["obs/cls_raw"][:]
     print(f"obs_cls_raw.shape = {obs_cls_raw.shape}")
 
-    _obs_fn = preprocessing.get_preprocessed_cl_observation_hard_cut if hard_cut else preprocessing.get_preprocessed_cl_observation
-    obs_cl = _obs_fn(
+    obs_cl = _obs_preprocessing_fn(scale_cut)(
         obs_cl=obs_cls_raw,
         msfm_conf=msfm_conf,
         dlss_conf=dlss_conf,
@@ -119,10 +136,10 @@ def evaluate_bench_fidu_cls(
 
     fiducial_cosmo = msfm_params.get_fiducials(params, msfm_conf)
 
-    evaluation.append_obs_to_file(pred_file, "obs/preds/bench_fidu_stack", fidu_preds)
-    evaluation.append_obs_to_file(pred_file, "obs/preds/bench_fidu_mean", np.mean(fidu_preds, axis=0))
-    evaluation.append_obs_to_file(pred_file, "obs/cosmos/bench_fidu", fiducial_cosmo)
-    print(f"Saved bench_fidu ({len(fidu_preds)} realizations) to {pred_file}")
+    evaluation.append_obs_to_file(pred_file, f"obs/preds/{out_label}_stack", fidu_preds)
+    evaluation.append_obs_to_file(pred_file, f"obs/preds/{out_label}_mean", np.mean(fidu_preds, axis=0))
+    evaluation.append_obs_to_file(pred_file, f"obs/cosmos/{out_label}", fiducial_cosmo)
+    print(f"Saved {out_label} ({len(fidu_preds)} realizations) to {pred_file}")
 
 
 def evaluate_des_y3(
@@ -138,7 +155,7 @@ def evaluate_des_y3(
     ggl_only=False,
     apply_log=True,
     ell_weighting=None,
-    hard_cut=False,
+    scale_cut="hard",
 ):
     from msfm.utils import catalog
 
@@ -147,8 +164,7 @@ def evaluate_des_y3(
     gc_count_map = catalog.build_maglim_map_from_cat(msfm_conf)
 
     print("Computing DES Y3 binned Cls...")
-    _obs_fn = preprocessing.get_preprocessed_cl_observation_hard_cut if hard_cut else preprocessing.get_preprocessed_cl_observation
-    des_cl = _obs_fn(
+    des_cl = _obs_preprocessing_fn(scale_cut)(
         wl_gamma_map=wl_gamma_map,
         gc_count_map=gc_count_map,
         msfm_conf=msfm_conf,

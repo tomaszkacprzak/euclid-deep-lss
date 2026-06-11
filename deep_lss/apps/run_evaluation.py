@@ -21,6 +21,8 @@ from msfm.utils import logger, files
 from deep_lss.utils import configuration, distribute, evaluation
 from deep_lss.models.base_model import BaseModel
 from deep_lss.nets import NETWORKS
+from deep_lss.nets.maps_plus_cls_network import MapsPlusCLSNetwork
+from deep_lss.nets.regression_head import get_cls_embedding_layers
 
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 warnings.filterwarnings("ignore", category=RuntimeWarning)
@@ -87,9 +89,9 @@ def setup():
     parser.add_argument("--include_des", action="store_true", help="evaluate DES Y3 catalogs")
     parser.add_argument("--include_buzzard", action="store_true", help="evaluate Buzzard N-body realizations")
     parser.add_argument("--buzzard_labels", nargs="+", default=["Buzzard_mean"])
-    parser.add_argument("--include_bench", action="store_true", help="evaluate benchmark simulations")
-    parser.add_argument("--bench_labels", nargs="+", default=["bench_bsc=rot", "bench_bsc=fit", "bench_bsc=0", "bench_bsc=1"])
-    parser.add_argument("--data_dir", type=str, default=None, help="base data directory (needed for --include_bench)")
+    parser.add_argument("--include_mocks", action="store_true", help="evaluate mock observations from data_dir/obs/")
+    parser.add_argument("--mock_labels", nargs="+", default=["fiducial_bench"])
+    parser.add_argument("--data_dir", type=str, default=None, help="base data directory (needed for --include_mocks)")
 
     args, _ = parser.parse_known_args()
 
@@ -108,8 +110,9 @@ def setup():
         LOGGER.warning(f"Loaded the model directory {args.dir_model} from {temp_file}")
 
     if args.debug:
-        tf.config.run_functions_eagerly(True)
-        LOGGER.warning(f"!!!!! Running the training in test mode, TensorFlow is executed eagerly !!!!!")
+        pass
+        # tf.config.run_functions_eagerly(True)
+        # LOGGER.warning(f"!!!!! Running the training in test mode, TensorFlow is executed eagerly !!!!!")
         # tf.config.set_soft_device_placement(False)
         # tf.debugging.set_log_device_placement(True)
         # tf.data.experimental.enable_debug_mode()
@@ -191,27 +194,70 @@ if __name__ == "__main__":
     # set up directories
     checkpoint_dir = os.path.abspath(os.path.join(args.dir_model, "checkpoint"))
 
+    return_cls = dlss_conf["dset"]["common"].get("return_cls", False)
+    if return_cls:
+        LOGGER.warning("return_cls=True in saved config — building MapsPlusCLSNetwork for evaluation")
+
+    max_batch_size = net_conf["dset"]["eval"]["grid"]["local_batch_size"]
+
     # create all of the variables within the strategy's scope, such that they are mirrored
     with strategy.scope():
-        # load the layers
-        network = NETWORKS[net_conf["network"]["name"]](
+        net_spec = NETWORKS[net_conf["network"]["name"]](
             out_features=n_output, smoothing_kwargs=smoothing_kwargs, **net_conf["network"]["kwargs"]
-        ).get_layers()
+        )
         LOGGER.info(f"Loaded a network specification of type {NETWORKS[net_conf['network']['name']]}")
 
-        # build the model, same regardless of the loss function (fiducial or grid)
-        model = BaseModel(
-            network=network,
-            n_side=smooth_nside,
-            indices=smooth_indices,
-            n_neighbors=net_conf["network"]["n_neighbors"],
-            input_shape=(None, len(smooth_indices), n_z_bins),
-            max_batch_size=net_conf["dset"]["eval"]["grid"]["local_batch_size"],
-            checkpoint_dir=checkpoint_dir,
-            # always load from a checkpoint
-            restore_checkpoint=True,
-            strategy=strategy,
-        )
+        if return_cls:
+            _, l_min_per_pair, l_max_per_pair = configuration.get_cls_bounds_per_pair(msfm_conf, dlss_conf)
+            n_cls_bins = net_conf["network"].get("cls_n_bins", 16)
+            cls_emb_widths = net_conf["network"].get("cls_embedding_layers", [512, 512, 512, 512])
+            cls_emb_dropout = net_conf["network"].get("cls_embedding_dropout_rate", None)
+            network = MapsPlusCLSNetwork(
+                conv_layers=net_spec.get_conv_layers(),
+                cls_embedding_layers=get_cls_embedding_layers(cls_emb_widths, dropout_rate=cls_emb_dropout),
+                regression_head_layers=net_spec.get_head_layers_no_flatten(),
+                n_side=smooth_nside,
+                tfr_n_side=n_side,
+                indices=smooth_indices,
+                n_neighbors=net_conf["network"]["n_neighbors"],
+                max_batch_size=max_batch_size,
+                initial_Fin=n_z_bins,
+                n_cls_bins=n_cls_bins,
+                l_min_per_pair=l_min_per_pair,
+                l_max_per_pair=l_max_per_pair,
+            )
+            network.gcnn.build((max_batch_size, len(smooth_indices), n_z_bins))
+            # Trace the full MapsPlusCLSNetwork so that network.built=True and BaseModel
+            # can call network.summary(). gcnn.build() only builds the map branch.
+            network(
+                (tf.zeros((2, len(smooth_indices), n_z_bins)),
+                 tf.zeros((2, 3 * n_side, len(l_min_per_pair)))),
+                training=False,
+            )
+            model = BaseModel(
+                network=network,
+                n_side=None,
+                indices=None,
+                n_neighbors=net_conf["network"]["n_neighbors"],
+                input_shape=None,
+                max_batch_size=max_batch_size,
+                checkpoint_dir=checkpoint_dir,
+                restore_checkpoint=True,
+                strategy=strategy,
+            )
+        else:
+            network = net_spec.get_layers()
+            model = BaseModel(
+                network=network,
+                n_side=smooth_nside,
+                indices=smooth_indices,
+                n_neighbors=net_conf["network"]["n_neighbors"],
+                input_shape=(None, len(smooth_indices), n_z_bins),
+                max_batch_size=max_batch_size,
+                checkpoint_dir=checkpoint_dir,
+                restore_checkpoint=True,
+                strategy=strategy,
+            )
 
     # Build a numpy-level model callable for individual observation evaluation.
     # Includes downsampling when smooth_nside < n_side.
@@ -224,9 +270,30 @@ if __name__ == "__main__":
             np.add.at(result, (slice(None), parent_output_idx, slice(None)), maps)
             return result / _counts[np.newaxis, :, np.newaxis]
 
-        model_fn = lambda x: model(_downsample(x), training=False).numpy()
+    if return_cls:
+        def _call_model(x, cls_raw):
+            # x: (B, n_pix_dv, n_ch); cls_raw: (B, n_ell, n_z_cross), precomputed consistently
+            # with training by forward_model_observation_map (same alm/smoothing pipeline that
+            # produces the Cls baked into the grid TFRecords) — passed in by evaluate_obs_*.
+            # HealpySmoothing's n_matmul_splits requires batch dim divisible by 2.
+            if x.shape[0] == 1:
+                x = np.concatenate([x, x], axis=0)
+                cls_raw = np.concatenate([cls_raw, cls_raw], axis=0)
+                return model((x, cls_raw), training=False).numpy()[:1]
+            return model((x, cls_raw), training=False).numpy()
     else:
-        model_fn = lambda x: model(x, training=False).numpy()
+        def _call_model(x, cls_raw=None):
+            # HealpySmoothing pre-computes n_matmul_splits=2 for this pixel resolution;
+            # tf.split requires the batch dim divisible by 2, so pad batch=1 → 2.
+            if x.shape[0] == 1:
+                x = np.concatenate([x, x], axis=0)
+                return model(x, training=False).numpy()[:1]
+            return model(x, training=False).numpy()
+
+    if parent_output_idx is not None:
+        model_fn = lambda x, cls_raw=None: _call_model(_downsample(x), cls_raw)
+    else:
+        model_fn = _call_model
 
     def evaluate_current_checkpoint(model):
         train_step = model.get_step()
@@ -287,14 +354,14 @@ if __name__ == "__main__":
         if out_file is not None:
             if args.include_grid:
                 with h5py.File(out_file, "r") as _f:
-                    _gp   = _f["grid/preds/test"][:]
-                    _gc   = _f["grid/cosmos/test"][:]
+                    _gp = _f["grid/preds/test"][:]
+                    _gc = _f["grid/cosmos/test"][:]
                     _isob = _f["grid/i_sobol/test"][:]
                     _isig = _f["grid/i_signal/test"][:]
                     _inoi = _f["grid/i_noise/test"][:]
                 if _gp.ndim == 3:
-                    _gp   = np.concatenate(_gp,   axis=0)
-                    _gc   = np.concatenate(_gc,   axis=0)
+                    _gp = np.concatenate(_gp, axis=0)
+                    _gc = np.concatenate(_gc, axis=0)
                     _isob = np.concatenate(_isob, axis=0)
                     _isig = np.concatenate(_isig, axis=0)
                     _inoi = np.concatenate(_inoi, axis=0)
@@ -306,9 +373,9 @@ if __name__ == "__main__":
             if args.include_buzzard:
                 evaluation.evaluate_obs_buzzard(model_fn, out_file, msfm_conf, dlss_conf, args.buzzard_labels)
 
-            if args.include_bench:
+            if args.include_mocks:
                 evaluation.evaluate_obs_benchmark(
-                    model_fn, out_file, msfm_conf, dlss_conf, args.data_dir, args.bench_labels
+                    model_fn, out_file, msfm_conf, dlss_conf, args.data_dir, args.mock_labels
                 )
 
         if args.wandb and out_file is not None:
@@ -331,3 +398,8 @@ if __name__ == "__main__":
     else:
         LOGGER.warning(f"Evaluating only the latest checkpoint")
         evaluate_current_checkpoint(model)
+
+    # Release TF checkpoint objects explicitly so _CheckpointRestoreCoordinatorDeleter
+    # is GC'd now, before interpreter shutdown nulls out TF module-level state.
+    model.checkpoint = None
+    model.checkpoint_manager = None
