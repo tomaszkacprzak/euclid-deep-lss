@@ -10,6 +10,7 @@ Meant for the GPU nodes of the Perlmutter cluster at NERSC.
 """
 
 import tensorflow as tf
+import torch
 
 for gpu in tf.config.list_physical_devices("GPU"):
     tf.config.experimental.set_memory_growth(gpu, True)
@@ -274,6 +275,11 @@ if __name__ == "__main__":
             np.add.at(result, (slice(None), parent_output_idx, slice(None)), maps)
             return result / _counts[np.newaxis, :, np.newaxis]
 
+    device = getattr(model, "device", torch.device("cuda" if torch.cuda.is_available() else "cpu"))
+
+    def _to_numpy(pred):
+        return pred.detach().cpu().numpy() if torch.is_tensor(pred) else np.asarray(pred)
+
     if return_cls:
         def _call_model(x, cls_raw):
             # x: (B, n_pix_dv, n_ch); cls_raw: (B, n_ell, n_z_cross), precomputed consistently
@@ -283,16 +289,22 @@ if __name__ == "__main__":
             if x.shape[0] == 1:
                 x = np.concatenate([x, x], axis=0)
                 cls_raw = np.concatenate([cls_raw, cls_raw], axis=0)
-                return model((x, cls_raw), training=False).numpy()[:1]
-            return model((x, cls_raw), training=False).numpy()
+                x_t = torch.as_tensor(x, dtype=torch.float32, device=device)
+                cls_t = torch.as_tensor(cls_raw, dtype=torch.float32, device=device)
+                return _to_numpy(model((x_t, cls_t), training=False))[:1]
+            x_t = torch.as_tensor(x, dtype=torch.float32, device=device)
+            cls_t = torch.as_tensor(cls_raw, dtype=torch.float32, device=device)
+            return _to_numpy(model((x_t, cls_t), training=False))
     else:
         def _call_model(x, cls_raw=None):
             # HealpySmoothing pre-computes n_matmul_splits=2 for this pixel resolution;
             # tf.split requires the batch dim divisible by 2, so pad batch=1 → 2.
             if x.shape[0] == 1:
                 x = np.concatenate([x, x], axis=0)
-                return model(x, training=False).numpy()[:1]
-            return model(x, training=False).numpy()
+                x_t = torch.as_tensor(x, dtype=torch.float32, device=device)
+                return _to_numpy(model(x_t, training=False))[:1]
+            x_t = torch.as_tensor(x, dtype=torch.float32, device=device)
+            return _to_numpy(model(x_t, training=False))
 
     if parent_output_idx is not None:
         model_fn = lambda x, cls_raw=None: _call_model(_downsample(x), cls_raw)

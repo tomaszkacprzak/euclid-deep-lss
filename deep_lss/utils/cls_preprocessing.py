@@ -13,7 +13,9 @@ import os
 
 import h5py
 import numpy as np
-import tensorflow as tf
+import torch
+from torch.utils.data import DataLoader, Dataset
+from torch.utils.data.distributed import DistributedSampler
 
 from msfm.utils import logger
 
@@ -202,13 +204,18 @@ def get_rebinned_cls_dsets(
     batch_size=1024,
     shuffle_buffer="full",
     prefetch=3,
-    num_parallel_calls=tf.data.AUTOTUNE,
+    num_workers=0,
+    pin_memory=None,
+    distributed=False,
+    rank=None,
+    world_size=None,
+    drop_last=False,
+    seed=None,
     float_type=np.float32,
 ):
-    """Load rebinned Cls from cache (building it if needed) and return TF datasets.
+    """Load rebinned Cls from cache (building it if needed) and return PyTorch data loaders.
 
-    Returns (cl_dset_train, cl_dset_test, out_dict) matching the interface of
-    dataset.get_binned_power_spectra_dset_for_scale_cut.
+    Returns (cl_loader_train, cl_loader_test, out_dict) matching the old data contents while using torch Dataset/DataLoader input handling.
 
     Args:
         data_dir: Base data directory (parent of cls/).
@@ -221,7 +228,7 @@ def get_rebinned_cls_dsets(
         noise_indices: Fraction or list for train/eval split on noise realizations.
         with_lensing, with_clustering, with_cross_z, with_cross_probe, ggl_only:
             Probe selection flags (same as existing pipeline).
-        batch_size: TF dataset batch size.
+        batch_size: DataLoader batch size.
     """
     from msfm.utils import files
     from msfm.utils import cross_statistics
@@ -329,36 +336,67 @@ def get_rebinned_cls_dsets(
 
     LOGGER.info(f"Train: {grid_cls_train.shape[0]} examples, Test: {grid_cls_test.shape[0]} examples")
 
-    # Build TF datasets. Sign-log is applied as an augmentation (not baked into cache),
-    # matching the pattern of the existing hard-cut pipeline.
-    if shuffle_buffer == "full":
-        shuffle_buffer = grid_cls_train.shape[0]
+    # Apply sign-log with NumPy before conversion to torch tensors so preprocessing stays
+    # framework-neutral. DataLoader handles batching, shuffling, workers and pinned memory.
+    if shuffle_buffer not in ("full", None, True, False):
+        LOGGER.warning("PyTorch DataLoader shuffles the full dataset; ignoring shuffle_buffer=%s", shuffle_buffer)
 
-    def _sign_log(signal, label):
-        signal = tf.math.sign(signal) * tf.math.log(tf.abs(signal) + 1e-10)
-        return signal, label
-
-    dset_train = (
-        tf.data.Dataset.from_tensor_slices((grid_cls_train, grid_cosmos_train))
-        .cache()
-        .shuffle(shuffle_buffer)
-        .repeat()
-        .batch(batch_size)
-        .map(_sign_log, num_parallel_calls=num_parallel_calls, deterministic=False)
-        .prefetch(prefetch)
-    )
-
-    dset_test = (
-        tf.data.Dataset.from_tensor_slices((grid_cls_test, grid_cosmos_test))
-        .cache()
-        .batch(batch_size)
-        .map(_sign_log, num_parallel_calls=num_parallel_calls, deterministic=True)
-        .prefetch(prefetch)
-    )
-
-    # Apply sign-log to the static eval arrays and obs Cls.
     def _np_sign_log(x):
         return np.sign(x) * np.log(np.abs(x) + 1e-10)
+
+    class ClsDataset(Dataset):
+        def __init__(self, cls, cosmos, transform=None):
+            cls = transform(cls) if transform is not None else cls
+            self.cls = np.asarray(cls, dtype=float_type)
+            self.cosmos = np.asarray(cosmos, dtype=float_type)
+
+        def __len__(self):
+            return self.cls.shape[0]
+
+        def __getitem__(self, index):
+            return (
+                torch.as_tensor(self.cls[index], dtype=torch.float32),
+                torch.as_tensor(self.cosmos[index], dtype=torch.float32),
+            )
+
+    train_dataset = ClsDataset(grid_cls_train, grid_cosmos_train, transform=_np_sign_log)
+    test_dataset = ClsDataset(grid_cls_test, grid_cosmos_test, transform=_np_sign_log)
+
+    if pin_memory is None:
+        pin_memory = torch.cuda.is_available()
+    generator = torch.Generator()
+    if seed is not None:
+        generator.manual_seed(int(seed))
+
+    train_sampler = None
+    test_sampler = None
+    if distributed:
+        train_sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=rank, shuffle=True, seed=0 if seed is None else int(seed), drop_last=drop_last)
+        test_sampler = DistributedSampler(test_dataset, num_replicas=world_size, rank=rank, shuffle=False, seed=0 if seed is None else int(seed), drop_last=False)
+
+    dset_train = DataLoader(
+        train_dataset,
+        batch_size=batch_size,
+        shuffle=train_sampler is None,
+        sampler=train_sampler,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        drop_last=drop_last,
+        generator=generator if train_sampler is None else None,
+        persistent_workers=num_workers > 0,
+        prefetch_factor=prefetch if num_workers > 0 else None,
+    )
+    dset_test = DataLoader(
+        test_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        sampler=test_sampler,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        drop_last=False,
+        persistent_workers=num_workers > 0,
+        prefetch_factor=prefetch if num_workers > 0 else None,
+    )
 
     out_dict = {
         "grid/cls_raw/train": grid_cls_train.copy(),

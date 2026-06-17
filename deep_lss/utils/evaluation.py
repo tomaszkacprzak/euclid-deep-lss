@@ -9,6 +9,7 @@ Evaluate the DeepSphere graph neural networks on the CosmoGrid
 
 import numpy as np
 import tensorflow as tf
+import torch
 import os, warnings, h5py, math, logging, wandb
 from trianglechain import TriangleChain
 
@@ -23,6 +24,16 @@ warnings.filterwarnings("ignore", category=DeprecationWarning)
 warnings.filterwarnings("ignore", category=RuntimeWarning)
 warnings.filterwarnings("once", category=UserWarning)
 LOGGER = logger.get_logger(__file__)
+
+
+def _as_torch_tensor(value, *, dtype=None, device=None):
+    if torch.is_tensor(value):
+        tensor = value
+    else:
+        tensor = torch.as_tensor(np.asarray(value))
+    if dtype is not None or device is not None:
+        tensor = tensor.to(dtype=dtype if dtype is not None else tensor.dtype, device=device if device is not None else tensor.device)
+    return tensor
 
 # Keys in dset.common that are only used by Cls-based pipelines and must be stripped
 # before constructing GridPipeline / FiducialPipeline (map-based pipelines don't accept them).
@@ -53,7 +64,7 @@ def _stack_grid_cosmos(tensors, sorted_indices, n_examples_per_cosmo):
     Args:
         tensors (list): List of tensors, where axis 0 of each element is the global batch size and len(tensors) is
             equal to the number of batches.
-        sorted_indices (tf.constant): Index tensor coming from the Sobol indices by which the tensor is sorted
+        sorted_indices (torch.Tensor): Index tensor coming from the Sobol indices by which the tensor is sorted
         n_examples_per_cosmo (int): How many example footprints there are per cosmology.
 
     Returns:
@@ -61,15 +72,14 @@ def _stack_grid_cosmos(tensors, sorted_indices, n_examples_per_cosmo):
             axes of the input
     """
     # concatenate all of the cosmologies into the first axis, shape (n_cosmos * n_examples_per_cosmo, None)
-    tensors = tf.concat(tensors, axis=0)
+    tensors = torch.cat([_as_torch_tensor(t) for t in tensors], dim=0)
+    sorted_indices = _as_torch_tensor(sorted_indices, dtype=torch.long, device=tensors.device)
     # instead of numpy fancy indexing
-    tensors = tf.gather(tensors, sorted_indices)
-    # split according to the cosmology, list of len n_cosmos with elements of shape (n_examples_per_cosmo, None)
-    tensors = tf.split(tensors, tensors.shape[0] // n_examples_per_cosmo)
-    # stack the cosmologies into the 0th axis, shape (n_cosmos, n_examples_per_cosmo, None)
-    tensors = tf.stack(tensors, axis=0)
+    tensors = torch.index_select(tensors, dim=0, index=sorted_indices)
+    # split according to the cosmology and stack into shape (n_cosmos, n_examples_per_cosmo, None)
+    tensors = tensors.reshape(tensors.shape[0] // n_examples_per_cosmo, n_examples_per_cosmo, *tensors.shape[1:])
 
-    return tensors.numpy()
+    return tensors.detach().cpu().numpy()
 
 
 def _remove_example_axis(array):
@@ -220,7 +230,7 @@ def evaluate_grid(
             second_to_last_layer.append(second_to_last_layer_batch)
 
     # sort according to the sobol index
-    sorted_indices = tf.argsort(tf.concat(i_sobols, axis=0), axis=0, stable=True)
+    sorted_indices = torch.argsort(torch.cat([_as_torch_tensor(t) for t in i_sobols], dim=0), dim=0, stable=True)
 
     # shape (n_cosmos, n_examples_per_cosmo, None)
     preds = _stack_grid_cosmos(preds, sorted_indices, n_examples_per_cosmo)
@@ -229,7 +239,7 @@ def evaluate_grid(
     i_noises = _stack_grid_cosmos(i_noises, sorted_indices, n_examples_per_cosmo)
     i_signals = _stack_grid_cosmos(i_signals, sorted_indices, n_examples_per_cosmo)
     if save_second_to_last_layer:
-        second_to_last_layer = _stack_grid_cosmos(second_to_last_layer_batch, sorted_indices, n_examples_per_cosmo)
+        second_to_last_layer = _stack_grid_cosmos(second_to_last_layer, sorted_indices, n_examples_per_cosmo)
     LOGGER.info(f"Reshaped the results")
 
     out_file = _get_out_file(dir_out, file_label)
@@ -391,20 +401,20 @@ def evaluate_fiducial(
         if save_second_to_last_layer:
             second_to_last_layer.append(second_to_last_layer_batch)
 
-    preds = tf.concat(preds, axis=0)
-    i_examples = tf.concat(i_examples, axis=0)
-    i_noises = tf.concat(i_noises, axis=0)
+    preds = torch.cat([_as_torch_tensor(t) for t in preds], dim=0)
+    i_examples = torch.cat([_as_torch_tensor(t) for t in i_examples], dim=0)
+    i_noises = torch.cat([_as_torch_tensor(t) for t in i_noises], dim=0)
     if save_second_to_last_layer:
-        second_to_last_layer = tf.concat(second_to_last_layer_batch, axis=0)
+        second_to_last_layer = torch.cat([_as_torch_tensor(t) for t in second_to_last_layer], dim=0)
     LOGGER.info(f"Reshaped the results")
 
     # sort according to the example index
-    sorted_indices = tf.argsort(i_examples)
-    preds = tf.gather(preds, sorted_indices)
-    i_examples = tf.gather(i_examples, sorted_indices)
-    i_noises = tf.gather(i_noises, sorted_indices)
+    sorted_indices = torch.argsort(i_examples)
+    preds = preds[sorted_indices]
+    i_examples = i_examples[sorted_indices]
+    i_noises = i_noises[sorted_indices]
     if save_second_to_last_layer:
-        second_to_last_layer = tf.gather(second_to_last_layer, sorted_indices)
+        second_to_last_layer = second_to_last_layer[sorted_indices]
     LOGGER.info(f"Sorted the results")
 
     out_file = _get_out_file(dir_out, file_label)
@@ -418,11 +428,11 @@ def evaluate_fiducial(
                 for key in keys:
                     if key in f:
                         del f[key]
-                f.create_dataset(name="fiducial/train/pred", data=preds)
-                f.create_dataset(name="fiducial/train/i_example", data=i_examples)
-                f.create_dataset(name="fiducial/train/i_noise", data=i_noises)
+                f.create_dataset(name="fiducial/train/pred", data=preds.detach().cpu().numpy())
+                f.create_dataset(name="fiducial/train/i_example", data=i_examples.detach().cpu().numpy())
+                f.create_dataset(name="fiducial/train/i_noise", data=i_noises.detach().cpu().numpy())
                 if save_second_to_last_layer:
-                    f.create_dataset(name="fiducial/train/second_to_last_layer", data=second_to_last_layer)
+                    f.create_dataset(name="fiducial/train/second_to_last_layer", data=second_to_last_layer.detach().cpu().numpy())
             else:
                 keys = ["fiducial/vali/pred", "fiducial/vali/i_example", "fiducial/vali/i_noise"]
                 if save_second_to_last_layer:
@@ -430,11 +440,11 @@ def evaluate_fiducial(
                 for key in keys:
                     if key in f:
                         del f[key]
-                f.create_dataset(name="fiducial/vali/pred", data=preds)
-                f.create_dataset(name="fiducial/vali/i_example", data=i_examples)
-                f.create_dataset(name="fiducial/vali/i_noise", data=i_noises)
+                f.create_dataset(name="fiducial/vali/pred", data=preds.detach().cpu().numpy())
+                f.create_dataset(name="fiducial/vali/i_example", data=i_examples.detach().cpu().numpy())
+                f.create_dataset(name="fiducial/vali/i_noise", data=i_noises.detach().cpu().numpy())
                 if save_second_to_last_layer:
-                    f.create_dataset(name="fiducial/vali/second_to_last_layer", data=second_to_last_layer)
+                    f.create_dataset(name="fiducial/vali/second_to_last_layer", data=second_to_last_layer.detach().cpu().numpy())
 
         LOGGER.info(f"Evaluation of the fiducial has finished, saved the predictions in {out_file}")
 
