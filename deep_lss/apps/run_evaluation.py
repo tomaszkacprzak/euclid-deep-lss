@@ -9,16 +9,13 @@ Evaluate the DeepSphere graph neural networks on the grid of cosmologies sampled
 Meant for the GPU nodes of the Perlmutter cluster at NERSC.
 """
 
-import tensorflow as tf
 import torch
-
-for gpu in tf.config.list_physical_devices("GPU"):
-    tf.config.experimental.set_memory_growth(gpu, True)
 
 import os, argparse, warnings, yaml, wandb, numpy as np, h5py
 
 from msfm.utils import logger, files
 
+from deep_lss.training import trainer
 from deep_lss.utils import configuration, distribute, evaluation
 from deep_lss.models.base_model import BaseModel
 from deep_lss.nets import NETWORKS
@@ -111,12 +108,7 @@ def setup():
         LOGGER.warning(f"Loaded the model directory {args.dir_model} from {temp_file}")
 
     if args.debug:
-        pass
-        # tf.config.run_functions_eagerly(True)
-        # LOGGER.warning(f"!!!!! Running the training in test mode, TensorFlow is executed eagerly !!!!!")
-        # tf.config.set_soft_device_placement(False)
-        # tf.debugging.set_log_device_placement(True)
-        # tf.data.experimental.enable_debug_mode()
+        LOGGER.warning("Debug mode enabled for PyTorch evaluation")
 
     return args
 
@@ -235,8 +227,8 @@ if __name__ == "__main__":
             # Trace the full MapsPlusCLSNetwork so that network.built=True and BaseModel
             # can call network.summary(). gcnn.build() only builds the map branch.
             network(
-                (tf.zeros((2, len(smooth_indices), n_z_bins)),
-                 tf.zeros((2, 3 * n_side, len(l_min_per_pair)))),
+                (torch.zeros((2, len(smooth_indices), n_z_bins)),
+                 torch.zeros((2, 3 * n_side, len(l_min_per_pair)))),
                 training=False,
             )
             model = BaseModel(
@@ -284,7 +276,7 @@ if __name__ == "__main__":
         def _call_model(x, cls_raw):
             # x: (B, n_pix_dv, n_ch); cls_raw: (B, n_ell, n_z_cross), precomputed consistently
             # with training by forward_model_observation_map (same alm/smoothing pipeline that
-            # produces the Cls baked into the grid TFRecords) — passed in by evaluate_obs_*.
+            # produces the Cls baked into the grid records) — passed in by evaluate_obs_*.
             # HealpySmoothing's n_matmul_splits requires batch dim divisible by 2.
             if x.shape[0] == 1:
                 x = np.concatenate([x, x], axis=0)
@@ -297,8 +289,7 @@ if __name__ == "__main__":
             return _to_numpy(model((x_t, cls_t), training=False))
     else:
         def _call_model(x, cls_raw=None):
-            # HealpySmoothing pre-computes n_matmul_splits=2 for this pixel resolution;
-            # tf.split requires the batch dim divisible by 2, so pad batch=1 → 2.
+            # The smoothing path expects an even batch at this pixel resolution; pad batch=1 → 2.
             if x.shape[0] == 1:
                 x = np.concatenate([x, x], axis=0)
                 x_t = torch.as_tensor(x, dtype=torch.float32, device=device)
@@ -417,8 +408,3 @@ if __name__ == "__main__":
     else:
         LOGGER.warning(f"Evaluating only the latest checkpoint")
         evaluate_current_checkpoint(model)
-
-    # Release TF checkpoint objects explicitly so _CheckpointRestoreCoordinatorDeleter
-    # is GC'd now, before interpreter shutdown nulls out TF module-level state.
-    model.checkpoint = None
-    model.checkpoint_manager = None

@@ -2,12 +2,8 @@ import argparse, h5py, os, random, yaml
 from pathlib import Path
 
 import numpy as np
-import tensorflow as tf
 import torch
 import itertools
-
-for gpu in tf.config.list_physical_devices(device_type="GPU"):
-    tf.config.experimental.set_memory_growth(gpu, True)
 
 from tqdm import tqdm
 
@@ -17,6 +13,7 @@ LOGGER = logger.get_logger(__file__)
 
 from deep_lss.models.grid_model import GridLossModel
 from deep_lss.nets.mlp import MultiLayerPerceptron, PCAWhiteningLayer
+from deep_lss.training import trainer
 from deep_lss.utils import cls_evaluation, configuration, evaluation
 
 from msi.utils import dataset
@@ -88,11 +85,10 @@ def main():
     seed = mlp_conf.get("seed", 42)
     random.seed(seed)
     np.random.seed(seed)
-    tf.random.set_seed(seed)
     torch.manual_seed(seed)
     if mlp_conf.get("deterministic_ops", False):
-        tf.config.experimental.enable_op_determinism()
-        LOGGER.info("Enabled tf.config.experimental.enable_op_determinism()")
+        torch.use_deterministic_algorithms(True, warn_only=True)
+        LOGGER.info("Enabled torch deterministic algorithms (warn_only=True)")
     LOGGER.info(f"seed           = {seed}")
 
     ema_momentum = mlp_conf.get("ema_momentum", None)
@@ -251,35 +247,39 @@ def main():
     summary_net.summary()
 
     lr = float(mlp_conf["learning_rate"])
-    if mlp_conf.get("lr_schedule", "cosine") == "constant":
-        lr_schedule = lr
-    else:
-        warmup_steps = mlp_conf.get("lr_warmup_steps", 0)
-        lr_alpha = mlp_conf.get("lr_alpha", 0.0)
-        lr_schedule = tf.keras.optimizers.schedules.CosineDecay(
-            initial_learning_rate=lr,
-            decay_steps=n_steps,
-            alpha=lr_alpha,
-            warmup_steps=warmup_steps,
-        )
     weight_decay = mlp_conf.get("weight_decay", None)
-    ema_kwargs = {"use_ema": True, "ema_momentum": float(ema_momentum)} if ema_momentum is not None else {}
+    optimizer_name = "adamw" if weight_decay is not None else "adam"
+    optimizer_kwargs = {"lr": lr}
     if weight_decay is not None:
-        optimizer = tf.keras.optimizers.AdamW(lr_schedule, weight_decay=float(weight_decay), **ema_kwargs)
-    else:
-        optimizer = tf.keras.optimizers.Adam(lr_schedule, **ema_kwargs)
+        optimizer_kwargs["weight_decay"] = float(weight_decay)
 
     summary_dir = os.path.join(pred_dir, "network/history")
+    runtime = trainer.create_runtime(
+        dist_strategy=mlp_conf.get("dist_strategy", None),
+        mixed_precision=mlp_conf.get("mixed_precision", False),
+        mixed_precision_dtype=mlp_conf.get("mixed_precision_dtype", "float16"),
+        grad_accum_steps=mlp_conf.get("grad_accum_steps", 1),
+    )
     model = GridLossModel(
         summary_net,
         n_side=None,
         indices=None,
-        optimizer=optimizer,
+        optimizer="adam",
+        optimizer_kwargs=optimizer_kwargs,
         checkpoint_dir=os.path.join(pred_dir, "network/checkpoint"),
         summary_dir=summary_dir,
         restore_checkpoint=args.restore_checkpoint,
-        xla=mlp_conf.get("xla", False),
+        xla=mlp_conf.get("compile_model", mlp_conf.get("xla", False)),
     )
+    if optimizer_name == "adamw":
+        model.optimizer = torch.optim.AdamW(model.parameters(), **optimizer_kwargs)
+    if mlp_conf.get("lr_schedule", "cosine") != "constant":
+        model.scheduler = trainer.CosineWithWarmupLR(
+            model.optimizer,
+            total_steps=n_steps,
+            warmup_steps=mlp_conf.get("lr_warmup_steps", 0),
+            alpha=mlp_conf.get("lr_alpha", 0.0),
+        )
 
     model.setup_grid_loss_step(
         batch_size=batch_size,
@@ -311,7 +311,7 @@ def main():
             "(cl, cosmo, i_sobol, i_signal); not yet supported in this script."
         )
 
-    tb_writer = tf.summary.create_file_writer(summary_dir)
+    tb_writer = trainer.ScalarWriter(summary_dir, enabled=model.is_chief())
 
     es_conf = mlp_conf.get("early_stopping", {})
     early_stopper = (
@@ -352,8 +352,7 @@ def main():
             train_loss_val = float(loss.detach().cpu().item() if torch.is_tensor(loss) else loss)
             train_steps.append(i)
             train_losses.append(train_loss_val)
-            with tb_writer.as_default():
-                tf.summary.scalar("loss/train", train_loss_val, step=i)
+            tb_writer.scalar("loss/train", train_loss_val, i)
             tb_writer.flush()
 
         if i > 0 and i % vali_every == 0:
@@ -374,9 +373,8 @@ def main():
             else:
                 mse_val = float("nan")
             vali_mse_history.append(mse_val)
-            with tb_writer.as_default():
-                tf.summary.scalar("loss/vali", vali_loss, step=i)
-                tf.summary.scalar("loss/vali_mse", mse_val, step=i)
+            tb_writer.scalar("loss/vali", vali_loss, i)
+            tb_writer.scalar("loss/vali_mse", mse_val, i)
             tb_writer.flush()
             LOGGER.info(f"step {i:>7d}  vali_loss = {vali_loss:.4f}  vali_mse = {mse_val:.4f}")
 
@@ -396,8 +394,7 @@ def main():
         # Overwrite live weights with their EMA average (in place), then save/evaluate with those.
         # This supersedes the early-stopping "best vali" restore as the final-weight selector;
         # early stopping still controls *when* the loop stops.
-        optimizer.finalize_variable_values(model.trainable_variables)
-        LOGGER.info(f"Finalized EMA weights (momentum={ema_momentum})")
+        LOGGER.warning("EMA finalization is not available in the PyTorch optimizer path; saving current weights")
         model.save_model()
     elif early_stopper is None:
         model.save_model()
