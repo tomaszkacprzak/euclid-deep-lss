@@ -3,6 +3,8 @@ from pathlib import Path
 
 import numpy as np
 import tensorflow as tf
+import torch
+import itertools
 
 for gpu in tf.config.list_physical_devices(device_type="GPU"):
     tf.config.experimental.set_memory_growth(gpu, True)
@@ -87,6 +89,7 @@ def main():
     random.seed(seed)
     np.random.seed(seed)
     tf.random.set_seed(seed)
+    torch.manual_seed(seed)
     if mlp_conf.get("deterministic_ops", False):
         tf.config.experimental.enable_op_determinism()
         LOGGER.info("Enabled tf.config.experimental.enable_op_determinism()")
@@ -331,19 +334,22 @@ def main():
             cls_test_eval = cls_test_eval * out_dict["ell_weights"].astype(np.float32)
     grid_cosmos_eval = np.array(out_dict["grid/cosmos/test"], dtype=np.float32)
     _n_eval = min(2048, len(cls_test_eval))
-    cls_test_eval_tf = tf.constant(cls_test_eval[:_n_eval])
-    grid_cosmos_eval_tf = tf.constant(grid_cosmos_eval[:_n_eval])
+    device = getattr(model, "device", torch.device("cuda" if torch.cuda.is_available() else "cpu"))
+    cls_test_eval_torch = torch.as_tensor(cls_test_eval[:_n_eval], dtype=torch.float32, device=device)
+    grid_cosmos_eval_torch = torch.as_tensor(grid_cosmos_eval[:_n_eval], dtype=torch.float32, device=device)
 
     train_steps, train_losses = [], []
     vali_steps, vali_losses_history, vali_mse_history = [], [], []
 
-    for i, (cl_batch, cosmo_batch) in tqdm(enumerate(cl_dset_train), total=n_steps + 1):
+    for i, (cl_batch, cosmo_batch) in tqdm(enumerate(itertools.cycle(cl_dset_train)), total=n_steps + 1):
         if i > n_steps:
             break
+        cl_batch = cl_batch.to(device, non_blocking=True) if torch.is_tensor(cl_batch) else torch.as_tensor(cl_batch, dtype=torch.float32, device=device)
+        cosmo_batch = cosmo_batch.to(device, non_blocking=True) if torch.is_tensor(cosmo_batch) else torch.as_tensor(cosmo_batch, dtype=torch.float32, device=device)
         loss = model.grid_train_step(cl_batch, cosmo_batch)
 
         if i % log_every == 0:
-            train_loss_val = float(loss.numpy())
+            train_loss_val = float(loss.detach().cpu().item() if torch.is_tensor(loss) else loss)
             train_steps.append(i)
             train_losses.append(train_loss_val)
             with tb_writer.as_default():
@@ -352,19 +358,19 @@ def main():
 
         if i > 0 and i % vali_every == 0:
             vali_loss_vals = [
-                float(model.vali_loss_fn(model(cl_v, training=False), cosmo_v).numpy())
+                float(model.vali_loss_fn(model(cl_v.to(device, non_blocking=True) if torch.is_tensor(cl_v) else torch.as_tensor(cl_v, dtype=torch.float32, device=device), training=False), cosmo_v.to(device, non_blocking=True) if torch.is_tensor(cosmo_v) else torch.as_tensor(cosmo_v, dtype=torch.float32, device=device)).detach().cpu().item())
                 for cl_v, cosmo_v in cl_dset_test
             ]
             vali_loss = np.mean(vali_loss_vals)
             vali_steps.append(i)
             vali_losses_history.append(vali_loss)
-            vali_preds = tf.concat(
-                [model(cls_test_eval_tf[j : j + batch_size], training=False) for j in range(0, _n_eval, batch_size)],
-                axis=0,
+            vali_preds = torch.cat(
+                [model(cls_test_eval_torch[j : j + batch_size], training=False) for j in range(0, _n_eval, batch_size)],
+                dim=0,
             )
             if hasattr(model, "vali_posterior_mean_fn"):
                 posterior_mean = model.vali_posterior_mean_fn(vali_preds)
-                mse_val = float(tf.reduce_mean(tf.square(posterior_mean - grid_cosmos_eval_tf)).numpy())
+                mse_val = float(torch.mean(torch.square(posterior_mean - grid_cosmos_eval_torch)).detach().cpu().item())
             else:
                 mse_val = float("nan")
             vali_mse_history.append(mse_val)
@@ -416,7 +422,7 @@ def main():
 
     grid_preds = np.concatenate(
         [
-            model(tf.constant(cls_test[i : i + batch_size]), training=False).numpy()
+            model(torch.as_tensor(cls_test[i : i + batch_size], dtype=torch.float32, device=device), training=False).detach().cpu().numpy()
             for i in range(0, len(cls_test), batch_size)
         ],
         axis=0,
@@ -442,7 +448,7 @@ def main():
         n_grid_obs = min(args.n_grid_examples, len(obs_cls))
         obs_preds = np.concatenate(
             [
-                model(tf.constant(obs_cls[i : i + batch_size], dtype=tf.float32), training=False).numpy()
+                model(torch.as_tensor(obs_cls[i : i + batch_size], dtype=torch.float32, device=device), training=False).detach().cpu().numpy()
                 for i in range(0, n_grid_obs, batch_size)
             ],
             axis=0,
