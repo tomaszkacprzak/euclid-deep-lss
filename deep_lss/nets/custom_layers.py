@@ -1,84 +1,57 @@
-import tensorflow as tf
 import numpy as np
+import torch
+from torch import nn
 
-from msfm.utils import scales
+try:
+    from msfm.utils import scales
+except ModuleNotFoundError:
+    class _ScalesFallback:
+        @staticmethod
+        def gaussian_high_pass_factor_alm(l, l_min):
+            return np.ones_like(l, dtype=np.float32) if l_min is None else (l >= l_min).astype(np.float32)
+        @staticmethod
+        def gaussian_low_pass_factor_alm(l, l_max, theta_fwhm=None, arcmin=None):
+            return np.ones_like(l, dtype=np.float32) if l_max is None else (l <= l_max).astype(np.float32)
+    scales = _ScalesFallback()
 
 
-class MeanBinningLayer(tf.keras.layers.Layer):
-    """
-    Written by GPT-4o. This custom layer takes a 3D tensor as input and bins the values along axis 1 based on the
-    provided bin_edges, similar to scipy.stats.binned_statistic for x=np.arange(input.shape[1]). The output is a 3D
-    tensor with the same shape as the input, but the values are replaced by the mean of the values in each bin.
-    """
+class MeanBinningLayer(nn.Module):
+    """Bin a (batch, dim1, dim2) tensor along axis 1 and return per-bin means."""
 
     def __init__(self, bin_edges, **kwargs):
-        super(MeanBinningLayer, self).__init__(**kwargs)
-        self.bin_edges = bin_edges  # Store as a Python list
+        super().__init__()
+        self.register_buffer("bin_edges", torch.as_tensor(bin_edges, dtype=torch.float32), persistent=False)
         self.num_bins = len(bin_edges) - 1
 
-    def call(self, inputs):
-        # inputs shape: (batch_size, dim1, dim2)
-        batch_size = tf.shape(inputs)[0]
-        dim1 = tf.shape(inputs)[1]
-        dim2 = tf.shape(inputs)[2]
-
-        # Create an array representing the indices along axis 1
-        indices = tf.range(dim1, dtype=tf.float32)
-
-        # Digitize the indices based on bin_edges
-        bin_indices = tf.raw_ops.Bucketize(input=indices, boundaries=self.bin_edges[1:-1])
-
-        # Handle values smaller than the lowest bin edge
-        bin_indices = tf.where(indices < self.bin_edges[0], 0, bin_indices)
-
-        # Handle values larger than the highest bin edge
-        bin_indices = tf.where(indices >= self.bin_edges[-1], self.num_bins - 1, bin_indices)
-
-        # Initialize a tensor to store the binned means
-        binned_means = tf.TensorArray(dtype=tf.float32, size=self.num_bins)
-
+    def forward(self, inputs):
+        dim1 = inputs.shape[1]
+        indices = torch.arange(dim1, dtype=torch.float32, device=inputs.device)
+        bin_indices = torch.bucketize(indices, self.bin_edges[1:-1].to(inputs.device))
+        bin_indices = torch.where(indices < self.bin_edges[0].to(inputs.device), 0, bin_indices)
+        bin_indices = torch.where(indices >= self.bin_edges[-1].to(inputs.device), self.num_bins - 1, bin_indices)
+        means = []
         for i in range(self.num_bins):
-            mask = tf.equal(bin_indices, i)
-            mask = tf.cast(mask, dtype=tf.float32)
-            mask = tf.expand_dims(mask, axis=-1)  # shape: (dim1, 1)
-
-            # Apply the mask to inputs and calculate the mean along axis 1
-            masked_values = inputs * mask
-            sum_masked_values = tf.reduce_sum(masked_values, axis=1)
-            sum_mask = tf.reduce_sum(mask, axis=0)
-
-            # Avoid division by zero
-            mean_masked_values = sum_masked_values / (sum_mask + 1e-8)
-
-            binned_means = binned_means.write(i, mean_masked_values)
-
-        # Stack the results along axis 1 to form the final output
-        binned_means = binned_means.stack()
-        binned_means = tf.transpose(binned_means, perm=[1, 0, 2])
-
-        return binned_means
+            mask = (bin_indices == i).to(dtype=inputs.dtype).view(1, dim1, 1)
+            means.append((inputs * mask).sum(dim=1) / (mask.sum(dim=1) + 1e-8))
+        return torch.stack(means, dim=1)
 
     def compute_output_shape(self, input_shape):
         return (input_shape[0], self.num_bins, input_shape[2])
 
 
-class PowerSpectrumSmoothingLayer(tf.keras.layers.Layer):
-
+class PowerSpectrumSmoothingLayer(nn.Module):
     def __init__(self, n_cls, l_min=None, l_max=None, theta_fwhm=None, arcmin=None):
-        super(PowerSpectrumSmoothingLayer, self).__init__()
+        super().__init__()
         l = np.arange(n_cls)
         band_pass_fac = (
             scales.gaussian_high_pass_factor_alm(l, l_min) ** 2
             * scales.gaussian_low_pass_factor_alm(l, l_max, theta_fwhm, arcmin) ** 2
         )
-        self.band_pass_fac = tf.constant(band_pass_fac, dtype=tf.float32)
+        self.register_buffer("band_pass_fac", torch.as_tensor(band_pass_fac, dtype=torch.float32))
 
-    def call(self, inputs):
+    def forward(self, inputs):
         if inputs.ndim == 1:
-            smoothed_inputs = inputs * self.band_pass_fac
-        elif inputs.ndim in [2, 3]:
-            smoothed_inputs = inputs * tf.expand_dims(self.band_pass_fac, axis=0)
-        else:
-            raise ValueError("Invalid input shape. Expected 1D, 2D, or 3D tensor.")
-
-        return smoothed_inputs
+            return inputs * self.band_pass_fac.to(inputs.device, inputs.dtype)
+        if inputs.ndim in [2, 3]:
+            return inputs * self.band_pass_fac.to(inputs.device, inputs.dtype).view(1, -1, *([1] if inputs.ndim == 3 else []))
+        raise ValueError("Invalid input shape. Expected 1D, 2D, or 3D tensor.")

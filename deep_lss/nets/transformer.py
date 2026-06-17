@@ -5,7 +5,7 @@ Created February 2024
 Author: Arne Thomsen
 """
 
-import tensorflow as tf
+from torch import nn
 from deep_lss.nets.deepsphere_torch import healpy_layers
 
 from deep_lss.nets.regression_head import get_regression_head
@@ -33,7 +33,7 @@ class ViTLayers:
         second_to_last_features=None,
         dropout_rate=None,
         # misc
-        activation=tf.nn.relu,
+        activation="relu",
         smoothing_kwargs=None,
     ) -> None:
         """
@@ -58,7 +58,7 @@ class ViTLayers:
             dropout_rate (float, optional): Dropout rate within the regression head. Defaults to None, then it's not
                 included.
             activation (callable, optional): Non-linear activation function to be used throughout. Defaults to
-                tf.nn.relu.
+                relu.
             smoothing_kwargs (dict, optional): Keyword arguments to be passed to the smoothing layer. Defaults to None,
                 then no smoothing is performed within the network.
         """
@@ -124,7 +124,7 @@ class GTLayers:
         second_to_last_features=None,
         dropout_rate=None,
         # misc
-        activation=tf.nn.relu,
+        activation="relu",
         smoothing_kwargs=None,
     ) -> None:
         """
@@ -149,7 +149,7 @@ class GTLayers:
             dropout_rate (float, optional): Dropout rate within the regression head. Defaults to None, then it's not
                 included.
             activation (callable, optional): Non-linear activation function to be used throughout. Defaults to
-                tf.nn.relu.
+                relu.
             smoothing_kwargs (dict, optional): Keyword arguments to be passed to the smoothing layer. Defaults to None,
                 then no smoothing is performed within the network.
         """
