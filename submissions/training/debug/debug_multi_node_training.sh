@@ -4,14 +4,14 @@
 #SBATCH --qos=debug
 #SBATCH --time=00:10:00
 #SBATCH --nodes=4
-#SBATCH --ntasks-per-node=4
+#SBATCH --ntasks-per-node=1
 #SBATCH --gpus-per-node=4
-#SBATCH --gpus-per-task=1
-#SBATCH --cpus-per-task=32
-#SBATCH --job-name=hvd_training_debug
+#SBATCH --gpus-per-task=4
+#SBATCH --cpus-per-task=128
+#SBATCH --job-name=ddp_training_debug
 #SBATCH --output="./logs/v15/training_debug_%j.log"
 
-STRATEGY="horovod"
+STRATEGY="ddp"
 VERSION="v15"
 
 # PROBE="lensing"
@@ -41,8 +41,10 @@ TRAIN_TFR="/pscratch/sd/a/athomsen/v11desy3/$VERSION/$SUBVERSION/tfrecords/$TRAI
 FIDU_EVAL_TFR="/pscratch/sd/a/athomsen/v11desy3/$VERSION/$SUBVERSION/tfrecords/fiducial/DESy3_fiducial_dmb_????.tfrecord"
 GRID_EVAL_TFR="/pscratch/sd/a/athomsen/v11desy3/$VERSION/$SUBVERSION/tfrecords/grid/DESy3_grid_dmb_????.tfrecord"
 
-srun --cpu-bind=threads --gpu-bind=single:1 --output=""$OUTPUT"_training.log" \
-    python ../../deep_lss/apps/run_training.py \
+srun --cpu-bind=threads --gpu-bind=none --output=""$OUTPUT"_training.log" \
+    torchrun --nnodes="$SLURM_NNODES" --nproc_per_node="$SLURM_GPUS_ON_NODE" \
+        --rdzv_backend=c10d --rdzv_endpoint="$(scontrol show hostnames "$SLURM_NODELIST" | head -n 1):29500" \
+        ../../deep_lss/apps/run_training.py \
     --dir_base="/pscratch/sd/a/athomsen/run_files/$VERSION/$SUBVERSION/debug/$PROBE/$LOSS" \
     --loss_function="$LOSS" \
     --train_tfr_pattern=$TRAIN_TFR \

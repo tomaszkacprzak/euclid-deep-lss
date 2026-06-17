@@ -1,4 +1,4 @@
-STRATEGY="mirrored"
+STRATEGY="ddp"
 VERSION="v7"
 # lensing, clustering, combined
 PROBE="lensing"
@@ -40,7 +40,7 @@ python deep_lss/apps/run_training.py \
 
 
 
-STRATEGY="horovod"
+STRATEGY="ddp"
 VERSION="v7"
 # lensing, clustering, combined
 PROBE="lensing"

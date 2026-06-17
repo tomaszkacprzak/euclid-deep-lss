@@ -12,7 +12,7 @@
 #SBATCH --output="./logs/v15/training_debug_%j.log"
 
 RUN_NUM=${RUN_NUM:-1}
-STRATEGY="mirrored"
+STRATEGY="ddp"
 VERSION="v15"
 
 PROBE="lensing"
@@ -50,7 +50,7 @@ fi
 
 
 srun --cpu-bind=threads --gpu-bind=none --output=""$OUTPUT"_training_debug.log" \
-    python ../../../deep_lss/apps/run_training.py \
+    torchrun --standalone --nproc_per_node="$SLURM_GPUS_ON_NODE" ../../../deep_lss/apps/run_training.py \
         --dist_strategy="$STRATEGY" \
         --dir_base="/pscratch/sd/a/athomsen/run_files/debug/$VERSION/$SUBVERSION/$PROBE/$LOSS" \
         --dir_model="wandb_test/v1" \

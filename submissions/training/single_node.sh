@@ -20,7 +20,7 @@ PROBE="lensing"
 # PROBE="combined"
 
 RUN_NUM=${RUN_NUM:-1}
-STRATEGY="mirrored"
+STRATEGY="ddp"
 LOSS="mutual_info"
 
 BASE="/pscratch/sd/a/athomsen/deep_lss/$VERSION/$SUBVERSION/maps/$PROBE"
@@ -36,7 +36,7 @@ if [ "$RUN_NUM" -gt 1 ]; then
 fi
 
 srun --cpu-bind=threads --gpu-bind=none --output=""$OUTPUT"_training.log" \
-    python ../../deep_lss/apps/run_training.py \
+    torchrun --standalone --nproc_per_node="$SLURM_GPUS_ON_NODE" ../../deep_lss/apps/run_training.py \
         --dir_base=$BASE \
         --dir_model=$MODEL \
         --loss_function=$LOSS \
@@ -54,7 +54,7 @@ srun --cpu-bind=threads --gpu-bind=none --output=""$OUTPUT"_training.log" \
 
 # evaluate all the network checkpoints in a separate script after training has completed to avoid CPU OOM errors
 srun --cpu-bind=threads --gpu-bind=none --output=""$OUTPUT"_inference.log" \
-    python ../../deep_lss/apps/run_evaluation.py \
+    torchrun --standalone --nproc_per_node="$SLURM_GPUS_ON_NODE" ../../deep_lss/apps/run_evaluation.py \
         --dist_strategy="$STRATEGY" \
         --grid_vali_tfr_pattern=$GRID_EVAL_TFR
 

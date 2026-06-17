@@ -8,14 +8,14 @@
 #SBATCH --ntasks-per-node=4
 #SBATCH --gpus-per-task=1
 #SBATCH --cpus-per-task=32
-#SBATCH --job-name=hvd_training
-#SBATCH --output=./logs/hvd_training.%j.log
+#SBATCH --job-name=ddp_training
+#SBATCH --output=./logs/ddp_training.%j.log
 
 # export NCCL_DEBUG=INFO
 
 srun --cpu-bind=threads --gpu-bind=single:1 \
     python ../../deep_lss/apps/run_training.py \
-    --dist_strategy="horovod" \
+    --dist_strategy="ddp" \
     --fidu_train_tfr_pattern="/pscratch/sd/a/athomsen/DESY3/v5/linear_bias/tfrecords/fiducial/DESy3_fiducial_???.tfrecord" \
     --fidu_vali_tfr_pattern="/pscratch/sd/a/athomsen/DESY3/v5/linear_bias/tfrecords/fiducial/validation/DESy3_fiducial_???.tfrecord" \
     --grid_vali_tfr_pattern="/pscratch/sd/a/athomsen/DESY3/v5/linear_bias/tfrecords/grid/DESy3_grid_???.tfrecord" \

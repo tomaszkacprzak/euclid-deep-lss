@@ -18,7 +18,7 @@ from msfm.grid_pipeline import GridPipeline
 from msfm.utils import logger, files
 
 from deep_lss.utils import distribute, configuration
-from deep_lss.utils.distribute import HorovodStrategy
+from deep_lss.utils.distribute import TorchDistributedStrategy
 
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 warnings.filterwarnings("ignore", category=RuntimeWarning)
@@ -268,7 +268,7 @@ def evaluate_grid(
 
         LOGGER.info(f"Evaluation of the grid has finished, saved the predictions in {out_file}")
 
-    if isinstance(model.strategy, (tf.distribute.MultiWorkerMirroredStrategy, HorovodStrategy)):
+    if isinstance(model.strategy, TorchDistributedStrategy) and model.strategy.num_replicas_in_sync > 1:
         if model.is_chief():
             LOGGER.info(f"Chief here")
             write_out_file()
@@ -448,7 +448,7 @@ def evaluate_fiducial(
 
         LOGGER.info(f"Evaluation of the fiducial has finished, saved the predictions in {out_file}")
 
-    if isinstance(model.strategy, (tf.distribute.MultiWorkerMirroredStrategy, HorovodStrategy)):
+    if isinstance(model.strategy, TorchDistributedStrategy) and model.strategy.num_replicas_in_sync > 1:
         if model.is_chief():
             LOGGER.info(f"Chief here")
             write_out_file()
