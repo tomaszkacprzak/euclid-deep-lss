@@ -7,7 +7,7 @@ Author: Arne Thomsen
 
 import tensorflow as tf
 
-from deepsphere import healpy_layers
+from deep_lss.nets.deepsphere_torch import healpy_layers
 from msfm.utils import logger
 
 LOGGER = logger.get_logger(__file__)

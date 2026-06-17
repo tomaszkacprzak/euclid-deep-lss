@@ -1,6 +1,6 @@
 import tensorflow as tf
 
-from deepsphere import healpy_layers
+from deep_lss.nets.deepsphere_torch import healpy_layers
 
 """
 This file contains the specifications for the training, e.g. the network layers

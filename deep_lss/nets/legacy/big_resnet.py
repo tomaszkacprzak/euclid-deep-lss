@@ -1,6 +1,6 @@
 import tensorflow as tf
 
-from deepsphere import healpy_layers
+from deep_lss.nets.deepsphere_torch import healpy_layers
 
 from kids1000_analysis import special_layers
 

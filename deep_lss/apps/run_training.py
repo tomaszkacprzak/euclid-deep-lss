@@ -569,8 +569,8 @@ def training():
         optimizer = optimization.get_optimizer(net_conf, args.loss_function, args.restore_checkpoint)
 
         if return_cls:
-            # Build a MapsPlusCLSNetwork: HealpyGCNN for maps + binned log-Cls concatenated.
-            # The model is passed pre-built so BaseModel uses it directly without re-wrapping in HealpyGCNN.
+            # Build a MapsPlusCLSNetwork: MapGCNN for maps + binned log-Cls concatenated.
+            # The model is passed pre-built so BaseModel uses it directly without re-wrapping in MapGCNN.
             _, l_min_per_pair, l_max_per_pair = configuration.get_cls_bounds_per_pair(msfm_conf, dlss_conf)
             n_cls_bins = net_conf["network"].get("cls_n_bins", 16)
             cls_emb_widths = net_conf["network"].get("cls_embedding_layers", [512, 512, 512, 512])

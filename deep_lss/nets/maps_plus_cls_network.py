@@ -7,7 +7,7 @@ Author: Arne Thomsen
 Network that concatenates DeepSphere map features with binned angular power spectra (Cls).
 
 Architecture:
-  1. HealpyGCNN processes the HEALPix maps → flatten → map_norm (LN)       (map branch)
+  1. MapGCNN processes the HEALPix maps → flatten → map_norm (LN)       (map branch)
   2. ClsBinningAndTransformLayer bins + gathers + sign-log-transforms Cls
      → cls_norm (LN) → cls_embedding MLP (Dense→LN × N)                    (Cls branch)
   3. Concatenate both branches
@@ -17,7 +17,7 @@ Architecture:
 import numpy as np
 import tensorflow as tf
 
-from deepsphere import HealpyGCNN
+from deep_lss.nets.deepsphere_torch import MapGCNN
 
 from msfm.utils import logger
 
@@ -95,7 +95,7 @@ class ClsBinningAndTransformLayer(tf.keras.layers.Layer):
 class MapsPlusCLSNetwork(tf.keras.Model):
     """Maps + Cls combined network.
 
-    Processes HEALPix maps with a DeepSphere HealpyGCNN, then concatenates the
+    Processes HEALPix maps with a DeepSphere MapGCNN, then concatenates the
     Cls branch (per-pair binned, sign-log-transformed, encoded by a small MLP)
     to the flattened GCNN output before the regression head.  Each branch is
     independently LayerNorm'd; the Cls embedding further processes the Cls
@@ -130,7 +130,7 @@ class MapsPlusCLSNetwork(tf.keras.Model):
                 resolution. The Cls stored in the TFRecords are not downsampled, so
                 ``n_ell = 3 * tfr_n_side``.
             indices (np.ndarray): 1-D array of HEALPix NEST pixel indices in the footprint.
-            n_neighbors (int): Number of neighbours for the HealpyGCNN graph.
+            n_neighbors (int): Number of neighbours for the MapGCNN graph.
             max_batch_size (int): Pre-allocated max batch size for sparse-dense matmul splits.
             initial_Fin (int): Number of input map channels (z-bins).
             n_cls_bins (int): Number of ell bins per cross pair.
@@ -139,7 +139,7 @@ class MapsPlusCLSNetwork(tf.keras.Model):
         """
         super().__init__()
 
-        self.gcnn = HealpyGCNN(
+        self.gcnn = MapGCNN(
             nside=n_side,
             indices=indices,
             layers=conv_layers,

@@ -24,7 +24,7 @@ LOGGER = logger.get_logger(__file__)
 
 class DeltaLossModel(BaseModel):
     """
-    This class subclasses the BaseModel to employ a HealpyGCNN with the information maximizing delta loss.
+    This class subclasses the BaseModel to employ a MapGCNN with the information maximizing delta loss.
     """
 
     def __init__(
@@ -53,7 +53,7 @@ class DeltaLossModel(BaseModel):
 
         Args:
             network (Union[list, torch.nn.Module]): The underlying network of the model. Can be a list of layers,
-                then a regular torch.nn.Sequential or HealpyGCNN model is initialized.
+                then a regular torch.nn.Sequential or MapGCNN model is initialized.
             n_side (int): The healpy n_side of the input.
             indices (np.ndarray): 1d array of indices, corresponding to the pixel ids of the input map footprint.
             n_neighbors (int, optional): Number of neighbors considered when building the graph, currently supported
@@ -164,7 +164,7 @@ class DeltaLossModel(BaseModel):
                 the finite differences in the computation of the Jacobian.
             n_points (int, optional): Number of different "fiducial" parameters. Defaults to 1.
             dim_x (int, optional): Input dimension of the network, must be provided if the network is not a
-                HealpyGCNN. Defaults to None.
+                MapGCNN. Defaults to None.
             dim_channels (int, optional): Number of channels. Defaults to 1.
             force_params_value (float, np.ndarray, optional): Either None or a set of parameters with shape
                 (n_points, 1, dim_summary) which is used to compute a square loss of the unperturbed summaries. It is

@@ -15,10 +15,7 @@ try:
 except ImportError:  # pragma: no cover - tensorboard is an optional runtime dependency
     SummaryWriter = None
 
-try:
-    from deepsphere import HealpyGCNN
-except ImportError:  # pragma: no cover - optional DeepSphere dependency
-    HealpyGCNN = None
+from deep_lss.nets.deepsphere_torch import MapGCNN
 
 from msfm.utils import logger
 
@@ -123,9 +120,7 @@ class BaseModel(object):
         if isinstance(network, list):
             if (n_side is None) and (indices is None):
                 return nn.Sequential(*network)
-            if HealpyGCNN is None:
-                raise ImportError("DeepSphere is required for HealpyGCNN networks")
-            return HealpyGCNN(
+            return MapGCNN(
                 nside=n_side, indices=indices, layers=network, n_neighbors=n_neighbors,
                 max_batch_size=max_batch_size, initial_Fin=initial_Fin
             )
