@@ -11,15 +11,11 @@ To train over the grid part of the CosmoGrid with the
 """
 
 import warnings
-import tensorflow as tf
-
-from deepsphere import HealpyGCNN
+import torch
 
 from msfm.utils import logger
 from deep_lss.utils import likelihood_loss, mutual_info_loss
-from deep_lss.utils.distribute import HorovodStrategy
 from deep_lss.models.base_model import BaseModel
-from deep_lss.utils.configuration import get_backend_floatx
 
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 warnings.filterwarnings("ignore", category=RuntimeWarning)
@@ -59,21 +55,21 @@ class GridLossModel(BaseModel):
         """Initializes a graph convolutional neural network using the healpy pixelization scheme.
 
         Args:
-            network (Union[list, tf.keras.Sequential]): The underlying network of the model. Can be a list of layers,
-                then either a regular tf.keras.Sequential or HealpyGCNN model is initialized.
+            network (Union[list, torch.nn.Module]): The underlying network of the model. Can be a list of layers,
+                then a regular torch.nn.Sequential or HealpyGCNN model is initialized.
             n_side (int): The healpy n_side of the input.
             indices (np.ndarray): 1d array of indices, corresponding to the pixel ids of the input map footprint.
             n_neighbors (int, optional): Number of neighbors considered when building the graph, currently supported
                 values are: 8, 20, 40 and 60. Defaults to 20.
             max_batch_size (int, optional): Maximal batch size this network is supposed to handle. This determines the
-                number of splits in the tf.sparse.sparse_dense_matmul operation, which are subsequently applied
+                number of splits in the sparse matrix multiplication operation, which are subsequently applied
                 independent of the actual batch size. Defaults to None, then no such precautions are taken, which may
                 cause an error.
             initial_Fin (int, optional) Initial number of input features. Defaults to None, then like for
                 max_batch_size, there are no precautions taken.
-            input_shape (tf.tensor, optional): Input shape of the network, necessary if one wants to restore the model.
+            input_shape (torch.Tensor, optional): Input shape of the network, necessary if one wants to restore the model.
                 Defaults to None.
-            optimizer (tf.keras.optimizers.Optimizer, optional): Optimizer of the model. Defaults to None, which loads
+            optimizer (torch.optim.Optimizer, optional): Optimizer of the model. Defaults to None, which loads
                 Adam.
             optimizer_kwargs (dict, optional): Keyword arguments passed to the optimizer. Defaults to {}.
             summary_dir (str, optional): Directory to save the summaries. Defaults to None.
@@ -84,11 +80,8 @@ class GridLossModel(BaseModel):
             init_step (int, optional): Initial step. Defaults to 0.
             z_bank_size (int, optional): Size of the memory bank for the z regularization. Defaults to None, then no
                 memory bank is used.
-            strategy (Union[tf.distribute.Strategy, deep_lss.utils.distribute.HorovodStrategy], optional):
-                The distribution strategy the model was created within. Defaults to None, then training is local.
-            xla (bool, optional): Whether to enable XLA just in time compilation. Note that this is incompatible with
-                the DeepSphere graph convolutional layers, as they contain unsupported
-                SparseDenseMatirxMultiplications. Defaults to False.
+            strategy (optional): Deprecated TensorFlow-era alias; pass a PyTorch distributed configuration to BaseModel instead.
+            xla (bool, optional): Deprecated TensorFlow-era alias for PyTorch compile_model. Defaults to False.
             summary_every (int, optional): Write TensorBoard summaries every N training steps. Defaults to 1.
         """
 
@@ -103,8 +96,8 @@ class GridLossModel(BaseModel):
             restore_checkpoint=restore_checkpoint,
             max_checkpoints=max_checkpoints,
             init_step=init_step,
-            strategy=strategy,
-            xla=xla,
+            distributed=bool(strategy) if strategy is not None else False,
+            compile_model=xla,
             summary_every=summary_every,
             # DeepSphere
             n_side=n_side,
@@ -159,10 +152,10 @@ class GridLossModel(BaseModel):
                 makeup of the Gaussian Mixture Model. Defaults to {}.
             lambda_tikhonov (float, optional): Regularization parameter for the Tikhonov regularization in the
                 likelihood loss. Defaults to None, then no regularization is applied.
-            clip_by_value (tf.tensor, optional): Clip the gradients by given 1d array of values into the interval
+            clip_by_value (torch.Tensor, optional): Clip the gradients by given 1d array of values into the interval
                 [value[0], value[1]]. Defaults to None (no clipping).
-            clip_by_norm (tf.tensor, optional): Clip the gradients by norm. Defaults to None (no clipping).
-            clip_by_global_norm (tf.tensor, optional): Clip the gradients by global norm. Defaults to 10.0.
+            clip_by_norm (torch.Tensor, optional): Clip the gradients by norm. Defaults to None (no clipping).
+            clip_by_global_norm (torch.Tensor, optional): Clip the gradients by global norm. Defaults to 10.0.
             l2_norm_weight (float, optional): Weight for the L2 norm of the trainable weights. Defaults to None
                 (no regularization).
             z_weight (float | dict | None, optional): Weight(s) for z-feature regularization. For
@@ -221,17 +214,8 @@ class GridLossModel(BaseModel):
 
         vali_loss_kwargs = {}
         if loss == "mse":
-            if isinstance(self.strategy, (tf.distribute.MirroredStrategy, tf.distribute.MultiWorkerMirroredStrategy)):
-                # to be compatible with the delta loss, the loss is averaged per replica
-                loss_fn = lambda preds, theta, training=True: (1.0 / batch_size) * tf.keras.losses.MeanSquaredError(
-                    reduction=tf.keras.losses.Reduction.SUM
-                )(preds, theta)
-            else:
-                loss_fn = lambda preds, theta, training=True: tf.keras.losses.MeanSquaredError(
-                    reduction=tf.keras.losses.Reduction.AUTO
-                )(preds, theta)
-
-            LOGGER.warning(f"Using the Mean Squared Error. Note that the labels should be normalized!")
+            loss_fn = lambda preds, theta, training=True: torch.nn.functional.mse_loss(preds, theta)
+            LOGGER.warning("Using the Mean Squared Error. Note that the labels should be normalized!")
 
         elif loss == "likelihood":
             assert dim_theta is not None, f"n_theta must be passed for the likelihood loss"
@@ -268,30 +252,11 @@ class GridLossModel(BaseModel):
                     dim_summary, dim_theta, **mutual_info_kwargs
                 )
 
-                if self.checkpoint_manager is not None:
-                    LOGGER.warning(f"Mutual info loss, overwriting the checkpoint manager")
-                    self.checkpoint = tf.train.Checkpoint(
-                        network=self.network,
-                        optimizer=self.optimizer,
-                        variational_head=self.variational_head,
-                        train_step=self.train_step,
-                    )
-                    self.checkpoint_manager = tf.train.CheckpointManager(
-                        self.checkpoint,
-                        self.checkpoint_dir,
-                        max_to_keep=self.max_checkpoints,
-                        checkpoint_name="ckpt",
-                        step_counter=self.train_step,
-                    )
                 if self.restore_from_checkpoint:
-                    LOGGER.warning(f"Mutual info loss, restoring the model again from within setup_grid_loss_step")
+                    LOGGER.warning("Mutual info loss, restoring the model again from within setup_grid_loss_step")
                     self.restore_model()
 
-                self.trainable_variables = self.variational_head.trainable_variables + self.network.trainable_variables
-
-                loss_fn = lambda preds, theta, training=True: tf.reduce_mean(
-                    self.variational_head([preds, theta], training=training)
-                )
+                loss_fn = lambda preds, theta, training=True: torch.mean(self.variational_head([preds, theta]))
                 self.vali_posterior_mean_fn = self.variational_head.estimator.mean
 
             # see https://arxiv.org/pdf/2010.10079
@@ -321,135 +286,23 @@ class GridLossModel(BaseModel):
         # to use the same loss function sepearately, without the need to perform the training step
         self.vali_loss_fn = lambda preds, theta: loss_fn(preds, theta, training=False, **vali_loss_kwargs)
 
-        # this isn't strictly necessary and could be removed
-        if isinstance(self.network, HealpyGCNN):
-            input_shape = (batch_size, len(self.network.indices_in), dim_channels)
-        elif dim_x is not None:
-            if dim_channels is not None:
-                input_shape = (batch_size, dim_x, dim_channels)
-            else:
-                input_shape = (batch_size, dim_x)
-        else:
-            input_shape = None
-
-        if input_shape is not None:
-            current_float = get_backend_floatx()
-            label_shape = (batch_size, dim_theta)
-            input_signature = [
-                tf.TensorSpec(shape=input_shape, dtype=current_float),
-                tf.TensorSpec(shape=label_shape, dtype=current_float),
-            ]
-            if uses_invariance:
-                # extra (i_sobol, i_signal) inputs forwarded by the training loop, used as positive-pair ids
-                index_shape = (batch_size,)
-                input_signature.extend(
-                    [tf.TensorSpec(shape=index_shape, dtype=tf.int64)] * 2
+        if not uses_invariance:
+            def grid_train_step(x, theta):
+                return self.base_train_step(
+                    input_tensor=x, input_labels=theta, loss_function=loss_fn,
+                    clip_by_value=clip_by_value, clip_by_norm=clip_by_norm,
+                    clip_by_global_norm=clip_by_global_norm, l2_norm_weight=l2_norm_weight,
+                    z_weight=z_weight, z_type=z_type, z_layer=z_layer,
                 )
-            tf_kwargs = {"input_signature": input_signature}
         else:
-            tf_kwargs = {}
-
-        # not distributed via tensorflow builtin
-        if (self.strategy is None) or isinstance(self.strategy, HorovodStrategy):
-
-            if not uses_invariance:
-
-                @tf.function(jit_compile=self.xla, **tf_kwargs)
-                def grid_train_step(x, theta):
-                    LOGGER.warning(f"Tracing grid_train_step")
-                    loss = self.base_train_step(
-                        input_tensor=x,
-                        input_labels=theta,
-                        loss_function=loss_fn,
-                        # gradient clipping + regularization
-                        clip_by_value=clip_by_value,
-                        clip_by_norm=clip_by_norm,
-                        clip_by_global_norm=clip_by_global_norm,
-                        l2_norm_weight=l2_norm_weight,
-                        z_weight=z_weight,
-                        z_type=z_type,
-                        z_layer=z_layer,
-                    )
-
-                    return loss
-
-            else:
-
-                @tf.function(jit_compile=self.xla, **tf_kwargs)
-                def grid_train_step(x, theta, i_sobol, i_signal):
-                    LOGGER.warning(f"Tracing grid_train_step (with VICReg invariance)")
-                    # pair_ids is forwarded as a tuple — stacking happens inside base_train_step where
-                    # the tensors are no longer wrapped in PerReplica (cf. distributed grid_train_step).
-                    loss = self.base_train_step(
-                        input_tensor=x,
-                        input_labels=theta,
-                        loss_function=loss_fn,
-                        # gradient clipping + regularization
-                        clip_by_value=clip_by_value,
-                        clip_by_norm=clip_by_norm,
-                        clip_by_global_norm=clip_by_global_norm,
-                        l2_norm_weight=l2_norm_weight,
-                        z_weight=z_weight,
-                        z_type=z_type,
-                        z_layer=z_layer,
-                        pair_ids=(i_sobol, i_signal),
-                    )
-
-                    return loss
-
-        # distributed via tensorflow builtin
-        elif isinstance(self.strategy, tf.distribute.Strategy):
-            # passing an input_signature like above for a distributed dset leads the following error:
-            # AttributeError: 'PerReplica' object has no attribute 'dtype'
-            # Instead do like https://www.tensorflow.org/tutorials/distribute/input#using_the_element_spec_property
-            if not uses_invariance:
-
-                @tf.function
-                def grid_train_step(x, theta):
-                    LOGGER.warning(f"Tracing distributed grid_train_step")
-                    global_loss = self.distributed_train_step(
-                        input_tensor=x,
-                        input_labels=theta,
-                        loss_function=loss_fn,
-                        # gradient clipping + regularization
-                        clip_by_value=clip_by_value,
-                        clip_by_norm=clip_by_norm,
-                        clip_by_global_norm=clip_by_global_norm,
-                        l2_norm_weight=l2_norm_weight,
-                        z_weight=z_weight,
-                        z_type=z_type,
-                        z_layer=z_layer,
-                    )
-
-                    return global_loss
-
-            else:
-
-                @tf.function
-                def grid_train_step(x, theta, i_sobol, i_signal):
-                    LOGGER.warning(f"Tracing distributed grid_train_step (with VICReg invariance)")
-                    # pair_ids is forwarded as a tuple of PerReplica tensors — strategy.run distributes each
-                    # leaf independently, and the stack into a (B, 2) tensor happens inside base_train_step
-                    # where the per-replica unwrapping has already taken place.
-                    global_loss = self.distributed_train_step(
-                        input_tensor=x,
-                        input_labels=theta,
-                        loss_function=loss_fn,
-                        # gradient clipping + regularization
-                        clip_by_value=clip_by_value,
-                        clip_by_norm=clip_by_norm,
-                        clip_by_global_norm=clip_by_global_norm,
-                        l2_norm_weight=l2_norm_weight,
-                        z_weight=z_weight,
-                        z_type=z_type,
-                        z_layer=z_layer,
-                        pair_ids=(i_sobol, i_signal),
-                    )
-
-                    return global_loss
-
-        else:
-            raise ValueError(f"Invalid strategy {self.strategy} was passed")
+            def grid_train_step(x, theta, i_sobol, i_signal):
+                return self.base_train_step(
+                    input_tensor=x, input_labels=theta, loss_function=loss_fn,
+                    clip_by_value=clip_by_value, clip_by_norm=clip_by_norm,
+                    clip_by_global_norm=clip_by_global_norm, l2_norm_weight=l2_norm_weight,
+                    z_weight=z_weight, z_type=z_type, z_layer=z_layer,
+                    pair_ids=(i_sobol, i_signal),
+                )
 
         LOGGER.info(f"Set up the training step of the {loss} loss")
         self.grid_train_step = grid_train_step

@@ -7,19 +7,14 @@ Author: Arne Thomsen, Janis Fluri
 Adapted from
 https://cosmo-gitlab.phys.ethz.ch/jafluri/cosmogrid_kids1000/-/blob/master/kids1000_analysis/delta_model.py
 by Janis Fluri, 
-the main difference is that here, the distribution happens via tf.distribute.Strategy instead of horovod.
+the current model lifecycle uses PyTorch modules, optimizers, and checkpoints.
 """
 
 import warnings
-import tensorflow as tf
-
-from deepsphere import HealpyGCNN
 
 from msfm.utils import logger
 from deep_lss.utils import delta_loss
-from deep_lss.utils.distribute import HorovodStrategy
 from deep_lss.models.base_model import BaseModel
-from deep_lss.utils.configuration import get_backend_floatx
 
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 warnings.filterwarnings("ignore", category=RuntimeWarning)
@@ -57,21 +52,21 @@ class DeltaLossModel(BaseModel):
         """Initializes a graph convolutional neural network using the healpy pixelization scheme.
 
         Args:
-            network (Union[list, tf.keras.Sequential]): The underlying network of the model. Can be a list of layers,
-                then either a regular tf.keras.Sequential or HealpyGCNN model is initialized.
+            network (Union[list, torch.nn.Module]): The underlying network of the model. Can be a list of layers,
+                then a regular torch.nn.Sequential or HealpyGCNN model is initialized.
             n_side (int): The healpy n_side of the input.
             indices (np.ndarray): 1d array of indices, corresponding to the pixel ids of the input map footprint.
             n_neighbors (int, optional): Number of neighbors considered when building the graph, currently supported
                 values are: 8, 20, 40 and 60. Defaults to 20.
             max_batch_size (int, optional): Maximal batch size this network is supposed to handle. This determines the
-                number of splits in the tf.sparse.sparse_dense_matmul operation, which are subsequently applied
+                number of splits in the sparse matrix multiplication operation, which are subsequently applied
                 independent of the actual batch size. Defaults to None, then no such precautions are taken, which may
                 cause an error.
             initial_Fin (int, optional) Initial number of input features. Defaults to None, then like for
                 max_batch_size, there are no precautions taken.
-            input_shape (tf.tensor, optional): Input shape of the network, necessary if one wants to restore the model.
+            input_shape (torch.Tensor, optional): Input shape of the network, necessary if one wants to restore the model.
                 Defaults to None.
-            optimizer (tf.keras.optimizers.Optimizer, optional): Optimizer of the model. Defaults to None, which loads
+            optimizer (torch.optim.Optimizer, optional): Optimizer of the model. Defaults to None, which loads
                 Adam.
             optimizer_kwargs (dict, optional): Keyword arguments for the optimizer. Defaults to {}.
             summary_dir (str, optional): Directory to save the summaries. Defaults to None.
@@ -80,11 +75,8 @@ class DeltaLossModel(BaseModel):
                 Defaults to False.
             max_checkpoints (int, optional): Maximum number of checkpoints to keep. Defaults to 3.
             init_step (int, optional): Initial step. Defaults to 0.
-            strategy (Union[tf.distribute.Strategy, deep_lss.utils.distribute.HorovodStrategy], optional):
-                The distribution strategy the model was created within. Defaults to None, then training is local.
-            xla (bool, optional): Whether to enable XLA just in time compilation. Note that this is incompatible with
-                the DeepSphere graph convolutional layers, as they contain unsupported
-                SparseDenseMatirxMultiplications. Defaults to False.
+            strategy (optional): Deprecated TensorFlow-era alias; pass a PyTorch distributed configuration to BaseModel instead.
+            xla (bool, optional): Deprecated TensorFlow-era alias for PyTorch compile_model. Defaults to False.
             summary_every (int, optional): Write TensorBoard summaries every N training steps. Defaults to 1.
         """
 
@@ -103,8 +95,8 @@ class DeltaLossModel(BaseModel):
             restore_checkpoint=restore_checkpoint,
             max_checkpoints=max_checkpoints,
             init_step=init_step,
-            strategy=strategy,
-            xla=xla,
+            distributed=bool(strategy) if strategy is not None else False,
+            compile_model=xla,
             summary_every=summary_every,
             # DeepSphere
             n_side=n_side,
@@ -144,7 +136,7 @@ class DeltaLossModel(BaseModel):
         use_log_det=True,
         tikhonov_regu=False,
         eps=1e-32,
-        # tf.summary
+        # TensorBoard
         img_summary=False,
     ):
         """This sets up a function that performs one training step with the delta loss, which tries to maximize the
@@ -198,10 +190,10 @@ class DeltaLossModel(BaseModel):
             no_correlations (bool, optional): Do not consider correlations between the parameter, this means that one
                 tries to find an optimal summary (single value) for each underlying model parameter, only possible if
                 dim_summary == n_params. Defaults to False.
-            clip_by_value (tf.tensor, optional): Clip the gradients by given 1d array of values into the interval
+            clip_by_value (torch.Tensor, optional): Clip the gradients by given 1d array of values into the interval
                 [value[0], value[1]]. Defaults to None (no clipping).
-            clip_by_norm (tf.tensor, optional): Clip the gradients by norm. Defaults to None (no clipping).
-            clip_by_global_norm (tf.tensor, optional): Clip the gradients by global norm. Defaults to None (no
+            clip_by_norm (torch.Tensor, optional): Clip the gradients by norm. Defaults to None (no clipping).
+            clip_by_global_norm (torch.Tensor, optional): Clip the gradients by global norm. Defaults to None (no
                 clipping).
             l2_norm_weight (float, optional): Weight for the L2 norm of the trainable weights. Defaults to None
                 (no regularization).
@@ -241,7 +233,7 @@ class DeltaLossModel(BaseModel):
                 use_log_det=use_log_det,
                 tikhonov_regu=tikhonov_regu,
                 eps=eps,
-                # tf.summary
+                # TensorBoard
                 summary_writer=self.summary_writer,
                 training=True,
                 img_summary=img_summary,
@@ -254,58 +246,16 @@ class DeltaLossModel(BaseModel):
         # to use the same loss function sepearately, without the need to perform the training step
         self.vali_loss_fn = lambda preds: loss_fn(preds, summary_suffix="_vali")
 
-        # get the backend float and input shape
-        current_float = get_backend_floatx()
-
-        n_batch = n_points * n_same * (2 * n_params + 1)
-        if isinstance(self.network, HealpyGCNN):
-            in_shape = (n_batch, len(self.network.indices_in), dim_channels)
-        else:
-            if dim_channels is None:
-                in_shape = (n_batch, dim_x)
-            else:
-                in_shape = (n_batch, dim_x, dim_channels)
-
-        # non distributed
-        if (self.strategy is None) or isinstance(self.strategy, HorovodStrategy):
-
-            @tf.function(input_signature=[tf.TensorSpec(shape=in_shape, dtype=current_float)], jit_compile=False)
-            def delta_train_step(input_batch):
-                LOGGER.warning(f"Tracing delta_train_step")
-                loss = self.base_train_step(
-                    input_tensor=input_batch,
-                    loss_function=loss_fn,
-                    input_labels=None,
-                    clip_by_value=clip_by_value,
-                    clip_by_norm=clip_by_norm,
-                    clip_by_global_norm=clip_by_global_norm,
-                    l2_norm_weight=l2_norm_weight,
-                )
-
-                return loss
-
-        # distributed
-        elif isinstance(self.strategy, tf.distribute.Strategy):
-            # passing an input_signature like above for a distributed dset leads the following error:
-            # AttributeError: 'PerReplica' object has no attribute 'dtype'
-            # Instead do like  https://www.tensorflow.org/tutorials/distribute/input#using_the_element_spec_property
-            @tf.function(jit_compile=False)
-            def delta_train_step(input_batch):
-                LOGGER.warning(f"Tracing distributed delta_train_step")
-                global_loss = self.distributed_train_step(
-                    input_tensor=input_batch,
-                    loss_function=loss_fn,
-                    input_labels=None,
-                    clip_by_value=clip_by_value,
-                    clip_by_norm=clip_by_norm,
-                    clip_by_global_norm=clip_by_global_norm,
-                    l2_norm_weight=l2_norm_weight,
-                )
-
-                return global_loss
-
-        else:
-            raise ValueError(f"Invalid strategy {self.strategy} was passed")
+        def delta_train_step(input_batch):
+            return self.base_train_step(
+                input_tensor=input_batch,
+                loss_function=loss_fn,
+                input_labels=None,
+                clip_by_value=clip_by_value,
+                clip_by_norm=clip_by_norm,
+                clip_by_global_norm=clip_by_global_norm,
+                l2_norm_weight=l2_norm_weight,
+            )
 
         LOGGER.info("Set up the training step of the delta loss")
         self.delta_train_step = delta_train_step
