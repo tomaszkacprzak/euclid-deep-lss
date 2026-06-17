@@ -10,11 +10,7 @@ import torch
 from torch import nn
 from torch.nn.parallel import DistributedDataParallel
 
-try:
-    from torch.utils.tensorboard import SummaryWriter
-except ImportError:  # pragma: no cover - tensorboard is an optional runtime dependency
-    SummaryWriter = None
-
+from deep_lss.utils.summary import TensorBoardLogger
 from deep_lss.nets.deepsphere_torch import MapGCNN
 
 from msfm.utils import logger
@@ -96,10 +92,7 @@ class BaseModel(object):
         self.optimizer = self._initialize_optimizer(optimizer, optimizer_kwargs)
         self.summary_dir = summary_dir
         if summary_dir is not None:
-            if SummaryWriter is None:
-                raise ImportError("torch.utils.tensorboard.SummaryWriter requires tensorboard to be installed")
-            Path(summary_dir).mkdir(parents=True, exist_ok=True)
-            self.summary_writer = SummaryWriter(summary_dir) if self.is_chief() else None
+            self.summary_writer = TensorBoardLogger(summary_dir, enabled=self.is_chief(), global_step=self.global_step)
         else:
             self.summary_writer = None
 
@@ -145,12 +138,18 @@ class BaseModel(object):
 
     def increment_step(self):
         self.global_step += 1
+        if self.summary_writer is not None:
+            self.summary_writer.set_step(self.global_step)
 
     def change_step(self, delta):
         self.global_step += int(delta)
+        if self.summary_writer is not None:
+            self.summary_writer.set_step(self.global_step)
 
     def set_step(self, step):
         self.global_step = int(step)
+        if self.summary_writer is not None:
+            self.summary_writer.set_step(self.global_step)
 
     def get_step(self):
         return int(self.global_step)
@@ -216,16 +215,7 @@ class BaseModel(object):
             return
         if self.global_step % self.summary_every != 0:
             return
-        if torch.is_tensor(value):
-            value = value.detach().cpu()
-        if summary_type == "scalar":
-            self.summary_writer.add_scalar(label, value, self.global_step)
-        elif summary_type == "histogram":
-            self.summary_writer.add_histogram(label, value, self.global_step)
-        elif summary_type == "image":
-            self.summary_writer.add_image(label, value, self.global_step)
-        else:
-            raise ValueError(f"Invalid summary type {summary_type} was passed")
+        self.summary_writer.write(label, value, summary_type=summary_type, step=self.global_step)
 
     def create_temp_dir(self, chief_dir):
         temp_dir = Path(chief_dir) / f"temp_worker_{torch.distributed.get_rank() if _is_dist_initialized() else 0}"

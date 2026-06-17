@@ -20,10 +20,7 @@ from msfm.utils import logger
 
 LOGGER = logger.get_logger(__file__)
 
-try:
-    from torch.utils.tensorboard import SummaryWriter
-except ImportError:  # pragma: no cover
-    SummaryWriter = None
+from deep_lss.utils.summary import TensorBoardLogger
 
 
 @dataclass
@@ -147,24 +144,23 @@ def save_checkpoint(path: str | Path, model, optimizer=None, scheduler=None, sca
 
 class ScalarWriter:
     def __init__(self, log_dir: str | Path | None, enabled: bool = True):
-        self.writer = None
-        if log_dir is not None and enabled:
-            if SummaryWriter is None:
-                raise ImportError("tensorboard is required for PyTorch SummaryWriter")
-            Path(log_dir).mkdir(parents=True, exist_ok=True)
-            self.writer = SummaryWriter(str(log_dir))
+        self.logger = TensorBoardLogger(log_dir, enabled=enabled) if log_dir is not None else None
+
+    @property
+    def writer(self):
+        return None if self.logger is None else self.logger.writer
 
     def scalar(self, name: str, value: float, step: int) -> None:
-        if self.writer is not None:
-            self.writer.add_scalar(name, value, step)
+        if self.logger is not None:
+            self.logger.write(name, value, summary_type="scalar", step=int(step))
 
     def flush(self) -> None:
-        if self.writer is not None:
-            self.writer.flush()
+        if self.logger is not None:
+            self.logger.flush()
 
     def close(self) -> None:
-        if self.writer is not None:
-            self.writer.close()
+        if self.logger is not None:
+            self.logger.close()
 
 
 class CosineWithWarmupLR(torch.optim.lr_scheduler.LambdaLR):
