@@ -32,19 +32,15 @@ dependencies = [
     "scikit-learn",
     "h5py",
     "pyyaml",
+    "torch",
+    "deepsphere @ git+https://github.com/deepsphere/deepsphere-pytorch.git",
+    "tensorboard",
     "wandb",
     "icecream",
     "pandas>=2.2.3",
 ]
 
 [project.optional-dependencies]
-# Only for environments where TensorFlow/Horovod are not pre-installed
-tf = [
-    "tensorflow>=2.0",
-    "tensorflow-probability",
-    "horovod[tensorflow]",
-]
-
 # Development tools
 dev = [
     "pytest",
