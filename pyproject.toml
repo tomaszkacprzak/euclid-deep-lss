@@ -38,11 +38,12 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# Only for environments where TensorFlow/Horovod are not pre-installed
-tf = [
-    "tensorflow>=2.0",
-    "tensorflow-probability",
-    "horovod[tensorflow]",
+# PyTorch runtime stack. Distributed training uses native torch.distributed/torchrun,
+# so no Horovod extra is required.
+torch = [
+    "torch",
+    "torchvision",
+    "pyro-ppl",
 ]
 
 # Development tools
