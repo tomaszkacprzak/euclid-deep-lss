@@ -41,7 +41,6 @@ warnings.filterwarnings("ignore", category=RuntimeWarning)
 warnings.filterwarnings("once", category=UserWarning)
 
 import tensorflow as tf
-import horovod.tensorflow as hvd
 import argparse, yaml, wandb, shutil
 
 from datetime import datetime
@@ -55,7 +54,7 @@ from msfm.utils import logger, input_output, files, parameters
 from deep_lss.utils import distribute, configuration, evaluation, optimization, delta_loss
 from deep_lss.models.delta_model import DeltaLossModel
 from deep_lss.models.grid_model import GridLossModel
-from deep_lss.utils.distribute import HorovodStrategy
+from deep_lss.utils.distribute import TorchDistributedStrategy
 from deep_lss.nets import NETWORKS
 from deep_lss.nets.maps_plus_cls_network import MapsPlusCLSNetwork
 from deep_lss.nets.regression_head import get_cls_embedding_layers
@@ -88,9 +87,9 @@ def setup():
     )
     parser.add_argument(
         "--dist_strategy",
-        choices=[None, "mirrored", "multi_worker_mirrored", "horovod"],
+        choices=[None, "ddp", "torch", "torchrun", "distributed", "slurm"],
         default=None,
-        help="distribution strategy, use None to run locally",
+        help="distribution strategy, use None to run locally; use ddp/torchrun for native PyTorch distributed",
     )
     parser.add_argument(
         "--train_tfr_pattern",
@@ -237,12 +236,8 @@ def setup():
             f"supported"
         )
 
-        if args.dist_strategy == "mirrored":
-            LOGGER.warning(f"XLA + MirroredStrategy freezes for unknown reasons")
-        elif args.dist_strategy == "horovod":
-            LOGGER.warning(
-                f"XLA + HorovodStrategy freezes for unknown reasons, see https://horovod.readthedocs.io/en/latest/xla.html"
-            )
+        if args.dist_strategy in {"ddp", "torch", "torchrun", "distributed", "slurm"}:
+            LOGGER.warning("XLA with distributed PyTorch should be validated for this workload")
 
     if args.debug:
         tf.config.run_functions_eagerly(True)
@@ -408,9 +403,9 @@ def training():
                 f.write(wandb_run.id)
 
         if args.wandb_sweep_id is not None:
-            if isinstance(strategy, HorovodStrategy):
+            if isinstance(strategy, TorchDistributedStrategy) and strategy.num_replicas_in_sync > 1:
                 # only the chief gets an agent, which provides the hyperparameters
-                if hvd.rank() == 0:
+                if strategy.replica_id == 0:
                     nested_hyperparam_conf = configuration.convert_dotted_to_nested_dict(wandb_run.config)
                     net_conf = configuration.update_nested_dict(net_conf, nested_hyperparam_conf["net"])
 
@@ -809,8 +804,8 @@ def training():
                 vali_batch, _, _ = batch_tuple
                 total, main = strategy.run(vali_loss_fn, args=(vali_batch,))
                 return (
-                    strategy.reduce(tf.distribute.ReduceOp.MEAN, total, axis=None),
-                    strategy.reduce(tf.distribute.ReduceOp.MEAN, main, axis=None),
+                    strategy.reduce("mean", total, axis=None),
+                    strategy.reduce("mean", main, axis=None),
                 )
 
             validation_loop = make_validation_loop(
@@ -869,8 +864,8 @@ def training():
                 x_batch = (dv_batch, cl_batch) if return_cls else dv_batch
                 loss, rmse = strategy.run(vali_loss_fn, args=(x_batch, cosmo_batch))
                 return (
-                    strategy.reduce(tf.distribute.ReduceOp.MEAN, loss, axis=None),
-                    strategy.reduce(tf.distribute.ReduceOp.MEAN, rmse, axis=None),
+                    strategy.reduce("mean", loss, axis=None),
+                    strategy.reduce("mean", rmse, axis=None),
                 )
 
             # vali_loss_fn has no z-regularization, so total == main; log both keys for
@@ -907,11 +902,7 @@ def training():
                     loss = model.grid_train_step(x_batch, cosmo_batch)
             t_compute_end = time()
 
-            # horovod
-            if isinstance(model.strategy, HorovodStrategy) and step == 1:
-                LOGGER.info(f"First step, broadcasting the variables through Horovod")
-                model.horovod_broadcast_variables()
-
+            # DDP synchronizes parameters during construction; no explicit first-step broadcast is needed.
             # delta loss
             if args.loss_function == "delta" and not args.restore_checkpoint and noise_schedule_steps is not None:
                 # assignment has to happen outside the tf.function
@@ -1106,16 +1097,10 @@ if __name__ == "__main__":
     if args.wandb_sweep_id is None:
         training()
     else:
-        if args.dist_strategy == "horovod":
-            # it doesn't hurt to initialize horovod more than once
-            hvd.init()
-
-            # only the chief gets an agent, similar to
-            # https://github.com/NERSC/nersc-dl-wandb/blob/958d1c7710719b0f91ff3236a77b551d6566b952/utils/trainer.py#L91C2-L91C2
-            # and https://github.com/NERSC/nersc-dl-wandb/blob/958d1c7710719b0f91ff3236a77b551d6566b952/train.py#L24
-            if hvd.rank() == 0:
+        if args.dist_strategy in {"ddp", "torch", "torchrun", "distributed", "slurm"}:
+            strategy = distribute.get_strategy(args.dist_strategy)
+            if strategy.replica_id == 0:
                 wandb.agent(args.wandb_sweep_id, function=training, project="y3-deep-lss", count=1)
-            # the workers get the agent's hyperparameters via broadcast
             else:
                 training()
         else:

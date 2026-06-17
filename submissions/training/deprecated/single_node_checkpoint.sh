@@ -11,7 +11,7 @@
 #SBATCH --job-name=training
 #SBATCH --output="./logs/v8/training_%j.log"
 
-STRATEGY="mirrored"
+STRATEGY="ddp"
 VERSION="v10"
 
 PROBE="lensing"

@@ -45,9 +45,9 @@ def setup():
     )
     parser.add_argument(
         "--dist_strategy",
-        choices=[None, "mirrored", "multi_worker_mirrored", "horovod"],
+        choices=[None, "ddp", "torch", "torchrun", "distributed", "slurm"],
         default=None,
-        help="distribution strategy, use None to run locally",
+        help="distribution strategy, use None to run locally; use ddp/torchrun for native PyTorch distributed",
     )
     parser.add_argument(
         "--fidu_train_tfr_pattern",

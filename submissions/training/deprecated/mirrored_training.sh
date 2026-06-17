@@ -15,7 +15,7 @@ srun --cpu-bind=threads --gpu-bind=none \
     python ../../../deep_lss/apps/run_training.py \
     --verbosity=debug \
     --loss_function="likelihood" \
-    --dist_strategy="mirrored" \
+    --dist_strategy="ddp" \
     --train_tfr_pattern="/pscratch/sd/a/athomsen/DESY3/v6/linear_bias/tfrecords/grid/DESy3_grid_*.tfrecord" \
     --fidu_vali_tfr_pattern="/pscratch/sd/a/athomsen/DESY3/v6/linear_bias/tfrecords/fiducial/validation/DESy3_fiducial_*.tfrecord" \
     --dir_base="/pscratch/sd/a/athomsen/run_files/v6/debug" \

@@ -14,7 +14,7 @@
 # -------- USER CONFIG --------
 MAX_RUNS=5                  # total number of chained runs
 RUN_NUM=${RUN_NUM:-1}       # defaults to 1 if not set
-STRATEGY="mirrored"
+STRATEGY="ddp"
 VERSION="v15"
 # PROBE="lensing"
 # PROBE="clustering"
