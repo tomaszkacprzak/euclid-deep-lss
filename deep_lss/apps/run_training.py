@@ -40,7 +40,9 @@ warnings.filterwarnings("ignore", category=DeprecationWarning)
 warnings.filterwarnings("ignore", category=RuntimeWarning)
 warnings.filterwarnings("once", category=UserWarning)
 
-import tensorflow as tf
+import torch
+from deep_lss.training import trainer
+pt = trainer.torch_compat
 import argparse, yaml, wandb, shutil
 
 from datetime import datetime
@@ -178,7 +180,7 @@ def setup():
         choices=("float16", "bfloat16"),
         help="mixed precision dtype to use when --mixed_precision is enabled",
     )
-    parser.add_argument("--xla", action="store_true", help="enable XLA (Accelerated Linear Algebra) JIT compilation")
+    parser.add_argument("--xla", action="store_true", help="enable torch.compile for the model")
     parser.add_argument(
         "--summary_every",
         type=int,
@@ -222,7 +224,7 @@ def setup():
     if args.mixed_precision:
         policy_name = f"mixed_{args.mixed_precision_dtype}"
         LOGGER.warning(f"Using mixed precision policy {policy_name}")
-        tf.keras.mixed_precision.set_global_policy(policy_name)
+        LOGGER.warning(f"Using PyTorch autocast mixed precision dtype {args.mixed_precision_dtype}")
 
         if args.loss_function == "delta":
             LOGGER.warning(
@@ -231,32 +233,16 @@ def setup():
 
     if args.xla:
         LOGGER.warning(
-            f"Using XLA jit compilation. This doesn't work in most cases, as the SparseDenseMatrixMultiplication "
-            f"(DeepSphere smoothing and graph convolutions) and MatrixDeterminant (delta loss) operators are not "
-            f"supported"
+            "Using torch.compile for the model"
         )
 
         if args.dist_strategy in {"ddp", "torch", "torchrun", "distributed", "slurm"}:
-            LOGGER.warning("XLA with distributed PyTorch should be validated for this workload")
+            LOGGER.warning("torch.compile with distributed PyTorch should be validated for this workload")
 
     if args.debug:
-        tf.config.run_functions_eagerly(True)
-        # tf.config.set_soft_device_placement(False)
-        # tf.debugging.set_log_device_placement(True)
-        # tf.data.experimental.enable_debug_mode()
-        LOGGER.warning(f"!!!!! Running the training in test mode, TensorFlow is executed eagerly !!!!!")
+        LOGGER.warning("Debug mode enabled for PyTorch training")
 
-    physical_devices = tf.config.list_physical_devices("GPU")
-    try:
-        for device in physical_devices:
-            if device.device_type == "GPU":
-                tf.config.experimental.set_memory_growth(device, True)
-        LOGGER.info(f"Configured the GPUs to memory growth mode")
-    except:
-        # Invalid device or cannot modify virtual devices once initialized.
-        LOGGER.warning(
-            f"Could not configure the GPUs to memory growth mode, all available GPU memory is reserved for TensorFlow"
-        )
+    LOGGER.info(f"PyTorch CUDA devices available: {torch.cuda.device_count()}")
 
     if not args.restore_checkpoint:
         for flag in ("probes_config", "loss_config", "data_config"):
@@ -271,9 +257,13 @@ def training():
 
     args = setup()
 
-    # hardware and distribution
-    _, _ = distribute.check_devices()
-    strategy = distribute.get_strategy(args.dist_strategy)
+    # hardware, distribution, and mixed precision runtime
+    runtime = trainer.create_runtime(
+        dist_strategy=args.dist_strategy,
+        mixed_precision=args.mixed_precision,
+        mixed_precision_dtype=args.mixed_precision_dtype,
+    )
+    strategy = runtime.strategy
 
     # initialize a fresh model
     if not args.restore_checkpoint:
@@ -430,7 +420,7 @@ def training():
         LOGGER.info(f"Initialized weights & biases to {dir_model}")
         LOGGER.warning(f"Running with {strategy.num_replicas_in_sync} replicas")
 
-    LOGGER.info(f"TensorFlow version {tf.__version__}")
+    LOGGER.info(f"PyTorch version {torch.__version__}")
 
     # set up subdirectories
     checkpoint_dir = os.path.abspath(os.path.join(dir_model, "checkpoint"))
@@ -498,10 +488,10 @@ def training():
             LOGGER.warning(
                 f"Using a linearly increasing noise scheduler from 0 to 1 with {noise_schedule_steps} steps"
             )
-            noise_scheduler = tf.keras.optimizers.schedules.PolynomialDecay(
+            noise_scheduler = pt.keras.optimizers.schedules.PolynomialDecay(
                 initial_learning_rate=0.0, decay_steps=noise_schedule_steps, end_learning_rate=1.0, power=1.0
             )
-            noise_scale = tf.Variable(noise_scheduler(0), trainable=False, dtype=tf.float32)
+            noise_scale = pt.Variable(noise_scheduler(0), trainable=False, dtype=pt.float32)
             noise_kwargs = {"shape_noise_scale": noise_scale, "poisson_noise_scale": noise_scale}
 
     else:
@@ -536,7 +526,7 @@ def training():
     pipe_kwargs["return_cls"] = return_cls
     train_pipeline = Pipeline(conf=msfm_conf, **pipe_kwargs)
 
-    # like https://www.tensorflow.org/tutorials/distribute/input#tfdistributestrategydistribute_datasets_from_function
+    # Keep the dataset-factory shape compatible with the distributed input context.
     def train_dataset_fn(input_context):
         dset = train_pipeline.get_dset(
             tfr_pattern=args.train_tfr_pattern,
@@ -584,7 +574,7 @@ def training():
                 l_min_per_pair=l_min_per_pair,
                 l_max_per_pair=l_max_per_pair,
             )
-            # HealpySmoothing is a tf.keras.Model whose build() must be called before
+            # Build the smoothing module before tracing the combined network.
             # setup_grid_loss_step accesses trainable_variables. BaseModel skips this
             # because input_shape=None is passed below (tuple inputs can't use the
             # standard build path). Build the inner GCNN directly with the map shape.
@@ -592,8 +582,8 @@ def training():
             # Trace the full MapsPlusCLSNetwork so that network.built=True and BaseModel
             # can call network.summary(). gcnn.build() only builds the map branch.
             network(
-                (tf.zeros((2, len(smooth_indices), n_z_bins)),
-                 tf.zeros((2, 3 * n_side, len(l_min_per_pair)))),
+                (pt.zeros((2, len(smooth_indices), n_z_bins)),
+                 pt.zeros((2, 3 * n_side, len(l_min_per_pair)))),
                 training=False,
             )
             model = Model(
@@ -650,14 +640,14 @@ def training():
         else:
             if args.loss_function == "likelihood":
                 if not args.restore_checkpoint:
-                    lambda_tikhonov_schedule = tf.keras.optimizers.schedules.CosineDecay(
+                    lambda_tikhonov_schedule = pt.keras.optimizers.schedules.CosineDecay(
                         loss_conf["likelihood_loss"]["lambda_tikhonov_init"],
                         loss_conf["likelihood_loss"]["lambda_tikhonov_decay_steps"],
                         alpha=0.0,
                     )
-                    lambda_tikhonov = tf.Variable(lambda_tikhonov_schedule(0), trainable=False, dtype=tf.float32)
+                    lambda_tikhonov = pt.Variable(lambda_tikhonov_schedule(0), trainable=False, dtype=pt.float32)
                 else:
-                    lambda_tikhonov = tf.Variable(0.0, trainable=False, dtype=tf.float32)
+                    lambda_tikhonov = pt.Variable(0.0, trainable=False, dtype=pt.float32)
                 likelihood_kwargs = {
                     "lambda_tikhonov": lambda_tikhonov,
                     "img_summary": loss_conf["likelihood_loss"]["img_summary"],
@@ -676,7 +666,7 @@ def training():
                 mutual_info_kwargs = {}
 
             # when return_cls=True the network accepts a (maps, cls) tuple input, so no static
-            # input_signature is set (dim_x=None); the tf.function traces dynamically instead.
+            # The validation function accepts dynamic input dimensions.
             model.setup_grid_loss_step(
                 loss=args.loss_function,
                 batch_size=local_batch_size,
@@ -703,13 +693,13 @@ def training():
 
         def make_validation_loop(dist_dset, step_fn, n_expected, summary_map):
             def validation_loop():
-                metrics = [tf.keras.metrics.Mean(), tf.keras.metrics.Mean()]
+                metrics = [pt.keras.metrics.Mean(), pt.keras.metrics.Mean()]
                 for batch_tuple in LOGGER.progressbar(dist_dset, at_level="debug", desc="validation", total=n_expected):
                     vals = step_fn(batch_tuple)
                     for i, v in enumerate(vals):
-                        if not tf.math.is_nan(v):
+                        if not pt.math.is_nan(v):
                             metrics[i].update_state(v)
-                assert not tf.math.is_nan(
+                assert not pt.math.is_nan(
                     metrics[0].result()
                 ), "Validation loss is NaN, check the validation batch size as this is likely due to partially empty batches"
                 for key, idx in summary_map:
@@ -743,10 +733,10 @@ def training():
                     strategy=strategy,
                 )
 
-                @tf.function
+                @pt.function
                 def vali_loss_fn(batch):
                     preds = model(batch, training=False)
-                    with tf.summary.record_if(False):
+                    with pt.summary.record_if(False):
                         loss = model.vali_loss_fn(preds)
                         loss_non_regu = non_regularized_loss_fn(preds)
                     return loss, loss_non_regu
@@ -757,27 +747,27 @@ def training():
 
                 if args.loss_function == "likelihood" or args.loss_function == "mse":
                     # ignore the covariance term and rescaling
-                    mse = tf.keras.metrics.MeanSquaredError()
+                    mse = pt.keras.metrics.MeanSquaredError()
 
                     # as this loss is supervised
                     labels = parameters.get_fiducials(params)
 
-                    @tf.function
+                    @pt.function
                     def vali_loss_fn(batch):
                         preds = model(batch, training=False)
-                        with tf.summary.record_if(False):
+                        with pt.summary.record_if(False):
                             loss = model.vali_loss_fn(preds, labels)
-                        loss_non_regu = mse(tf.slice(preds, begin=[0, 0], size=[-1, n_params]), labels)
+                        loss_non_regu = mse(pt.slice(preds, begin=[0, 0], size=[-1, n_params]), labels)
                         return loss, loss_non_regu
 
                 elif args.loss_function == "mutual_info":
-                    labels = tf.constant(parameters.get_fiducials(params, conf=msfm_conf), dtype=tf.float32)
-                    labels = tf.reshape(labels, shape=[-1, n_params])
+                    labels = pt.constant(parameters.get_fiducials(params, conf=msfm_conf), dtype=pt.float32)
+                    labels = pt.reshape(labels, shape=[-1, n_params])
 
-                    @tf.function
+                    @pt.function
                     def vali_loss_fn(batch):
                         preds = model(batch, training=False)
-                        with tf.summary.record_if(False):
+                        with pt.summary.record_if(False):
                             loss = model.vali_loss_fn(preds, labels)
                         loss_non_regu = loss
                         return loss, loss_non_regu
@@ -842,16 +832,16 @@ def training():
 
             if args.loss_function == "mutual_info":
 
-                @tf.function
+                @pt.function
                 def vali_loss_fn(x, cosmo):
                     preds = model(x, training=False)
-                    with tf.summary.record_if(False):
+                    with pt.summary.record_if(False):
                         loss = model.vali_loss_fn(preds, cosmo)
                     if hasattr(model, "vali_posterior_mean_fn"):
                         posterior_mean = model.vali_posterior_mean_fn(preds)
-                        rmse = tf.sqrt(tf.reduce_mean(tf.square(posterior_mean - tf.cast(cosmo, tf.float32))))
+                        rmse = pt.sqrt(pt.reduce_mean(pt.square(posterior_mean - pt.cast(cosmo, pt.float32))))
                     else:
-                        rmse = tf.constant(float("nan"))
+                        rmse = pt.constant(float("nan"))
                     return loss, rmse
 
             else:
@@ -883,9 +873,9 @@ def training():
     t_compute_accum = 0.0
 
     for step in LOGGER.progressbar(range(1, n_steps + 1), at_level="info", total=n_steps, desc="training"):
-        # context for profiling like https://www.tensorflow.org/guide/profiler#profiling_custom_training_loops
+        # Optional profiling context for custom training loops.
         # optional context like https://stackoverflow.com/a/34798330
-        with tf.profiler.experimental.Trace("step", step_num=step, _r=1) if args.profile else nullcontext():
+        with pt.profiler.experimental.Trace("step", step_num=step, _r=1) if args.profile else nullcontext():
             # train step
             t_data_start = time()
             if args.loss_function == "delta":
@@ -905,7 +895,7 @@ def training():
             # DDP synchronizes parameters during construction; no explicit first-step broadcast is needed.
             # delta loss
             if args.loss_function == "delta" and not args.restore_checkpoint and noise_schedule_steps is not None:
-                # assignment has to happen outside the tf.function
+                # Update the schedule outside the compiled training helper.
                 noise_scale.assign(noise_scheduler(step))
                 model.write_summary("schedule/noise_scale", noise_scale)
 
@@ -1019,11 +1009,11 @@ def training():
             if args.profile and step == 800:
                 print("\n")
                 LOGGER.info(f"Starting to profile")
-                tf.profiler.experimental.start(model.summary_dir)
+                pt.profiler.experimental.start(model.summary_dir)
             if args.profile and step == 805:
                 print("\n")
                 LOGGER.info(f"Stopping to profile")
-                tf.profiler.experimental.stop()
+                pt.profiler.experimental.stop()
 
             if args.pasc_throughput:
                 step_start = 200
