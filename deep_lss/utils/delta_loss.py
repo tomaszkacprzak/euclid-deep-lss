@@ -7,33 +7,31 @@ Author: Arne Thomsen, Janis Fluri
 Adapted from
 https://cosmo-gitlab.phys.ethz.ch/jafluri/cosmogrid_kids1000/-/blob/master/kids1000_analysis/losses.py
 by Janis Fluri, 
-the main difference is that here, the distribution happens via tf.distribute.Strategy instead of horovod.
+the main difference is that this version uses PyTorch tensor operations.
 """
 
 import numpy as np
-import tensorflow as tf
-import horovod.tensorflow as hvd
+import torch
 
-from deep_lss.utils import summary, configuration
-from deep_lss.utils.distribute import HorovodStrategy
+from deep_lss.utils import summary
 
 from msfm.utils import logger
 
 LOGGER = logger.get_logger(__file__)
 
 
-def tf_matrix_condition(m):
+def torch_matrix_condition(m):
     """Calculate the matrix condition number of an input m over the last two axis, defined as the ratio of the largest
     and smallest singular value
 
     Args:
-        m (tf.tensor): The input tensor of shape [...,N,M]
+        m (torch.Tensor): The input tensor of shape [...,N,M]
 
     Returns:
-        tf.tensor: The condition number of shape [...]
+        torch.Tensor: The condition number of shape [...]
     """
-    s = tf.linalg.svd(m, compute_uv=False)
-    return s[..., 0] / s[..., -1]
+    s = torch.linalg.svdvals(m)
+    return s[..., 0] / s[..., -1].clamp_min(torch.finfo(m.dtype).eps)
 
 
 def get_jac_and_cov_matrix(
@@ -43,27 +41,23 @@ def get_jac_and_cov_matrix(
     a specific ordering of the predictions.
 
     Args:
-        predictions (tf.tensor): Predictions of shape (n_same * (1 + 2 * n_params), n_params) in a fixed ordering.
+        predictions (torch.Tensor): Predictions of shape (n_same * (1 + 2 * n_params), n_params) in a fixed ordering.
         n_params (int): Number of underlying model parameters.
         n_same (int): Number of realizations of the same parameter (the perturbations don't count).
         off_sets (np.ndarray): The finite differences in the underlying parameters to calculate the Jacobian.
         n_output (_type_, optional): dimensionality of the summary statistic, defaults to predictions.shape[-1] if None.
-        summary_writer (tf.summary.SummaryWriter, optional): Used to write tensorboard summaries. Defaults to None.
+        summary_writer (optional): Used to write tensorboard summaries. Defaults to None.
         training (bool, optional): Wheter the network is currently training. If False, no summary is written even if a
             writer is provided. Defaults to False.
-            strategy (Union[tf.distribute.Strategy, deep_lss.utils.distribute.HorovodStrategy], optional):
-                The distribution strategy the model was created within. Defaults to None, then training is local.
+            strategy (optional): Reserved for distributed loss aggregation. Defaults to None, then training is local.
 
     Returns:
-        tf.tensor: Covariances and Jacobians, these have shape (n_output/n_params, n_output, n_output), where n_output
+        torch.Tensor: Covariances and Jacobians, these have shape (n_output/n_params, n_output, n_output), where n_output
             is the dimensionality of the summary statistic.
     """
-    # get the current backend
-    current_float = configuration.get_backend_floatx()
-
-    # needs to be a tf.tensor, has shape (n_same * (1 + 2 * n_params), n_params)
+    # needs to be a torch.Tensor, has shape (n_same * (1 + 2 * n_params), n_params)
     if isinstance(predictions, np.ndarray):
-        predictions = tf.convert_to_tensor(predictions, dtype=current_float)
+        predictions = torch.as_tensor(predictions)
 
     # get number of outputs
     if n_output is None:
@@ -71,30 +65,19 @@ def get_jac_and_cov_matrix(
 
     # split the local output, len(splits) = (1 + 2 * n_params), split.shape = splits[0].shape = (?, n_same, n_output)
     splits = [
-        tf.reshape(split, shape=[-1, n_same, n_output])
-        for split in tf.split(predictions, num_or_size_splits=2 * n_params + 1, axis=0)
+        torch.reshape(split, shape=(-1, n_same, n_output))
+        for split in torch.chunk(predictions, chunks=2 * n_params + 1, dim=0)
     ]
 
-    # non distributed
-    if strategy is None:
-        # minus one because this is the sample covariance
-        cov_normalization = n_same - 1.0
-    # NOTE distributed
-    elif isinstance(strategy, tf.distribute.Strategy):
-        # gather from the replicas to get a more stable estimate of the covariance and jacobian
-        splits = [tf.distribute.get_replica_context().all_gather(split, axis=1) for split in splits]
-        cov_normalization = strategy.num_replicas_in_sync * n_same - 1.0
-    elif isinstance(strategy, HorovodStrategy):
-        # Horovod allgather is always performed along the first axis, so these transposes are a necesarry workaround
-        splits = [tf.transpose(hvd.allgather(tf.transpose(split, perm=[1, 0, 2])), perm=[1, 0, 2]) for split in splits]
-        cov_normalization = strategy.num_replicas_in_sync * n_same - 1.0
-    else:
-        raise ValueError(f"Invalid strategy {strategy} was passed")
+    if strategy is not None:
+        raise NotImplementedError("Distributed delta-loss aggregation must be provided by the PyTorch training loop")
+    # minus one because this is the sample covariance
+    cov_normalization = predictions.new_tensor(float(n_same) - 1.0)
 
     # summary
     if training:
         # len(param_splits) = n_params, param_splits[0].shape = (?, n_same, n_output)
-        param_splits = tf.split(splits[0], num_or_size_splits=n_output, axis=-1)
+        param_splits = torch.split(splits[0], split_size_or_sections=1, dim=-1)
 
         for num, single_param in enumerate(param_splits):
             summary.write_summary(
@@ -102,26 +85,26 @@ def get_jac_and_cov_matrix(
             )
 
     # get the covariance NOTE the mean is taken over the n_same, the (local/global) batch size
-    mean = tf.reduce_mean(splits[0], axis=1, keepdims=True)
+    mean = torch.mean(splits[0], dim=1, keepdim=True)
 
     # shape (n_output/n_params, n_same, n_params)
-    outmm = tf.subtract(splits[0], mean)
+    outmm = torch.subtract(splits[0], mean)
 
     # shape (n_output/n_params, n_output, n_output)
-    cov = tf.divide(tf.einsum("hjk,hjl->hkl", outmm, outmm), cov_normalization, name="COV")
+    cov = torch.divide(torch.einsum("hjk,hjl->hkl", outmm, outmm), cov_normalization)
 
     # handle off sets and renormalization
-    off_sets = tf.convert_to_tensor(off_sets, dtype=current_float)
+    off_sets = torch.as_tensor(off_sets, dtype=predictions.dtype, device=predictions.device)
 
     # get mean derivatives NOTE the mean is taken over the n_same, the batch size
     derivatives = []
     for i in range(n_params):
-        mean_minus = tf.reduce_mean(splits[2 * (i + 1) - 1], axis=1, keepdims=False)
-        mean_plus = tf.reduce_mean(splits[2 * (i + 1)], axis=1, keepdims=False)
-        derivatives.append(tf.divide(tf.subtract(mean_plus, mean_minus), tf.scalar_mul(2.0, off_sets[i])))
+        mean_minus = torch.mean(splits[2 * (i + 1) - 1], dim=1, keepdim=False)
+        mean_plus = torch.mean(splits[2 * (i + 1)], dim=1, keepdim=False)
+        derivatives.append(torch.divide(torch.subtract(mean_plus, mean_minus), 2.0 * off_sets[i]))
 
     # stack the derivatives to form the Jacobian, shape (n_output/n_params, n_output, n_output)
-    jacobian = tf.stack(derivatives, axis=-1)
+    jacobian = torch.stack(derivatives, dim=-1)
 
     return cov, jacobian
 
@@ -130,18 +113,18 @@ def get_jac_and_cov_matrix(
 #     """Calculates the approximate fisher information given a covariance matrix and jacobian
 
 #     Args:
-#         cov (tf.tensor): The covariance matrix of the summary
-#         jacobian (tf.tensor): The jacobian of the summary
+#         cov (torch.Tensor): The covariance matrix of the summary
+#         jacobian (torch.Tensor): The jacobian of the summary
 
 #     Returns:
-#         tf.tensor: The approximate fisher matrix
+#         torch.Tensor: The approximate fisher matrix
 #     """
 
 #     # calculate approximate fisher information like below eq. (14) in https://arxiv.org/pdf/2107.09002.pdf
 #     # F = inv(J^-1 cov J^T^-1) = J^T cov^-1 J
-#     inv_cov = tf.linalg.inv(cov)
-#     fisher = tf.einsum("aij,ajk->aik", inv_cov, jacobian)
-#     fisher = tf.einsum("aji,ajk->aik", jacobian, fisher)
+#     inv_cov = torch.linalg.inv(cov)
+#     fisher = torch.einsum("aij,ajk->aik", inv_cov, jacobian)
+#     fisher = torch.einsum("aji,ajk->aik", jacobian, fisher)
 
 #     return fisher
 
@@ -166,7 +149,7 @@ def delta_loss(
     use_log_det=True,
     tikhonov_regu=False,
     eps=1e-32,
-    # tf.summary
+    # summary
     summary_writer=None,
     training=True,
     img_summary=False,
@@ -186,7 +169,7 @@ def delta_loss(
             * and so on
 
     Args:
-        predictions (tf.tensor): The predictions a.k.a. summary statistics in the specified ordering.
+        predictions (torch.Tensor): The predictions a.k.a. summary statistics in the specified ordering.
         n_params (int): Number of underlying (cosmological) model parameters.
         n_same (int): Number of (uperturbed) summaries coming from the same parameter set, this is the same as the
             (local) batch size
@@ -224,20 +207,20 @@ def delta_loss(
             to False.
         eps (float, optional): A small positive value used for regularization of things like logs etc. This should
             only be increased if tikhonov_regu is used and a error is raised. Defaults to 1e-32.
-        summary_writer (tf.summary.SummaryWriter, optional): The writer used to write tensorboard summaries. Defaults
+        summary_writer (optional): The writer used to write tensorboard summaries. Defaults
             to None.
         training (bool, optional): Whether the loss is used for training. If False, no summaries will be written even
             if a summary_writer is supplied. Defaults to True.
         img_summary (bool, optional): Save image summaries of the Jacobian and the covariance. Defaults to False.
         print_scalar (bool, optional): Print the scalar value of the loss to the console. Defaults to False.
         summary_suffix (str, optional): A label used to identify the summaries in tensorboard. Defaults to "".
-        strategy (tf.distribute.Strategy): The distribution strategy the model was created within
+        strategy (optional): Reserved for distributed loss aggregation.
 
     Raises:
         ValueError: When there are specifications that conflict with the no_correlations boolean.
 
     Returns:
-        tf.tensor: The loss value, which can be negative.
+        torch.Tensor: The loss value, which can be negative.
     """
 
     LOGGER.warning(f"Tracing delta_loss")
@@ -245,9 +228,6 @@ def delta_loss(
     # TODO: A fixed epsilon can lead to some problems. E.g. in tikonov regularization might fail because the lack
     # TODO: of precision. A possible solution would be to use the machine epsilon for added regularization
     # TODO: and a fixed epsilon for absolut regulatization (division or log errors...)
-
-    # get the current float backend
-    current_float = configuration.get_backend_floatx()
 
     # get cov and jac of shapes (n_output/n_params, n_output, n_output)
     cov, jacobian = get_jac_and_cov_matrix(
@@ -267,36 +247,36 @@ def delta_loss(
         "delta_jacobian_hist" + summary_suffix, jacobian, summary_writer, training, summary_type="histogram"
     )
     if img_summary:
-        jac_img = tf.expand_dims(jacobian, axis=3)
-        jac_max = tf.reduce_max(jac_img, axis=(1, 2), keepdims=True)
-        jac_min = tf.reduce_min(jac_img, axis=(1, 2), keepdims=True)
-        jac_img = tf.math.divide(jac_img - jac_min, jac_max - jac_min)
+        jac_img = torch.unsqueeze(jacobian, dim=3)
+        jac_max = torch.amax(jac_img, dim=(1, 2), keepdim=True)
+        jac_min = torch.amin(jac_img, dim=(1, 2), keepdim=True)
+        jac_img = torch.divide(jac_img - jac_min, jac_max - jac_min)
         summary.write_summary(
             "delta_jacobian_img" + summary_suffix, jac_img, summary_writer, training, summary_type="image"
         )
 
-        cov_img = tf.expand_dims(cov, axis=3)
-        cov_max = tf.reduce_max(cov_img, axis=(1, 2), keepdims=True)
-        cov_min = tf.reduce_min(cov_img, axis=(1, 2), keepdims=True)
-        cov_img = tf.math.divide(cov_img - cov_min, cov_max - cov_min)
+        cov_img = torch.unsqueeze(cov, dim=3)
+        cov_max = torch.amax(cov_img, dim=(1, 2), keepdim=True)
+        cov_min = torch.amin(cov_img, dim=(1, 2), keepdim=True)
+        cov_img = torch.divide(cov_img - cov_min, cov_max - cov_min)
         summary.write_summary(
             "delta_covariance_img" + summary_suffix, cov_img, summary_writer, training, summary_type="image"
         )
 
         # get corrlation matrix
-        v = tf.math.sqrt(tf.linalg.diag_part(cov))
-        outer_v = tf.einsum("ai,aj->aij", v, v)
-        cor = tf.divide(cov, outer_v)
-        cor_img = tf.expand_dims(cor, axis=3)
+        v = torch.sqrt(torch.diagonal(cov, dim1=-2, dim2=-1))
+        outer_v = torch.einsum("ai,aj->aij", v, v)
+        cor = torch.divide(cov, outer_v)
+        cor_img = torch.unsqueeze(cor, dim=3)
         # fit between 0 and 1
-        cor_img = tf.math.add(0.5, tf.math.scalar_mul(0.5, cor_img))
+        cor_img = torch.add(0.5, 0.5 * cor_img)
         summary.write_summary(
             "delta_correlation_img" + summary_suffix, cor_img, summary_writer, training, summary_type="image"
         )
 
     # in case predictions is a numpy array
     if isinstance(predictions, np.ndarray):
-        predictions = tf.convert_to_tensor(predictions, dtype=current_float)
+        predictions = torch.as_tensor(predictions)
 
     # get number of outputs
     if n_output is None:
@@ -329,65 +309,57 @@ def delta_loss(
         # check if we are in no correlation regime
         if no_correlations:
             # tikhonov_regu and normal regu is the same in this case
-            cov_diag = tf.linalg.diag_part(cov)
-            cov_log_det = tf.math.log(cov_diag + eps)
-            jac_diag = tf.linalg.diag_part(jacobian)
-            jac_log_det = tf.math.log(tf.square(jac_diag) + eps)
+            cov_diag = torch.diagonal(cov, dim1=-2, dim2=-1)
+            cov_log_det = torch.log(cov_diag + predictions.new_tensor(eps))
+            jac_diag = torch.diagonal(jacobian, dim1=-2, dim2=-1)
+            jac_log_det = torch.log(torch.square(jac_diag) + predictions.new_tensor(eps))
             # the factor of 2 is in the square of the jac_diag
-            cov_det_loss = tf.reduce_mean(tf.subtract(cov_log_det, jac_log_det))
+            cov_det_loss = torch.mean(torch.subtract(cov_log_det, jac_log_det))
 
         # NOTE use everything, this is the default branch
         elif n_partial is None:
-            # tf.logdet is much better for the backprop, but fails if the det is zero
+            # torch.logdet is much better for the backprop, but fails if the det is zero
             # should we do cov + eps*identity?
             if tikhonov_regu:
-                identity = tf.scalar_mul(eps, tf.eye(n_params, batch_shape=[1], dtype=current_float))
+                identity = torch.eye(n_params, dtype=predictions.dtype, device=predictions.device).unsqueeze(0) * predictions.new_tensor(eps)
                 # we use that 2*log(det(A)) = log(det(A)^2) = log(det(A)*det(A)) = log(det(A)*det(A^T))
-                #                           = log(det(A*A^T))tf.eye
-                with tf.name_scope("jac_logdet") as scope:
-                    jt_j = tf.einsum("aji,ajk->aik", jacobian, jacobian)
-                    jac_log_det = tf.linalg.logdet(tf.add(jt_j, identity))
-                with tf.name_scope("cov_logdet") as scope:
-                    cov_log_det = tf.linalg.logdet(tf.add(cov, identity))
-                    cov_det_loss = tf.subtract(cov_log_det, jac_log_det)
+                #                           = log(det(A*A^T))identity
+                jt_j = torch.einsum("aji,ajk->aik", jacobian, jacobian)
+                jac_log_det = torch.logdet(torch.add(jt_j, identity))
+                cov_log_det = torch.logdet(torch.add(cov, identity))
+                cov_det_loss = torch.subtract(cov_log_det, jac_log_det)
             # NOTE no tikhonov regularization is the default
             else:
-                with tf.name_scope("jac_logdet") as scope:
-                    jac_log_det = tf.math.log(tf.math.abs(tf.linalg.det(jacobian)) + eps)
-                with tf.name_scope("cov_logdet") as scope:
-                    # We add a abs here because of instabilities
-                    cov_log_det = tf.math.log(tf.math.abs(tf.linalg.det(cov)) + eps)
+                jac_log_det = torch.log(torch.abs(torch.linalg.det(jacobian)) + predictions.new_tensor(eps))
+                # We add a abs here because of instabilities
+                cov_log_det = torch.log(torch.abs(torch.linalg.det(cov)) + predictions.new_tensor(eps))
 
-                    if print_scalar:
-                        tf.print(f"cov_log_det: {cov_log_det}")
-                        tf.print(f"jac_log_det: {-2.0 * jac_log_det}")
+                if print_scalar:
+                    print(f"cov_log_det: {cov_log_det}")
+                    print(f"jac_log_det: {-2.0 * jac_log_det}")
 
-                    cov_det_loss = tf.subtract(cov_log_det, tf.scalar_mul(2.0, jac_log_det))
+                cov_det_loss = torch.subtract(cov_log_det, 2.0 * jac_log_det)
 
         else:
             # we use only the first n_partial params
             j_part = jacobian[:, :, :n_partial]
 
             # now we need to calculate log(det(J^T cov J)) - log(det(J^T J))
-            cov_j = tf.einsum("aij,ajk->aik", cov, j_part)
-            jt_cov_j = tf.einsum("aji,ajk->aik", j_part, cov_j)
-            jt_j = tf.einsum("aji,ajk->aik", j_part, j_part)
+            cov_j = torch.einsum("aij,ajk->aik", cov, j_part)
+            jt_cov_j = torch.einsum("aji,ajk->aik", j_part, cov_j)
+            jt_j = torch.einsum("aji,ajk->aik", j_part, j_part)
 
             if tikhonov_regu:
                 id_dim = np.minimum(n_params, n_partial)
-                identity = tf.scalar_mul(eps, tf.eye(id_dim, batch_shape=[1], dtype=current_float))
-                with tf.name_scope("jac_logdet") as scope:
-                    jac_log_det = tf.linalg.logdet(tf.add(jt_j, identity))
-                with tf.name_scope("cov_logdet") as scope:
-                    cov_log_det = tf.linalg.logdet(tf.add(jt_cov_j, identity))
+                identity = torch.eye(id_dim, dtype=predictions.dtype, device=predictions.device).unsqueeze(0) * predictions.new_tensor(eps)
+                jac_log_det = torch.logdet(torch.add(jt_j, identity))
+                cov_log_det = torch.logdet(torch.add(jt_cov_j, identity))
             else:
                 # We add a abs here because of instabilities
-                with tf.name_scope("jac_logdet") as scope:
-                    jac_log_det = tf.math.log(tf.math.abs(tf.linalg.det(jt_j)) + eps)
-                with tf.name_scope("cov_logdet") as scope:
-                    cov_log_det = tf.math.log(tf.math.abs(tf.linalg.det(jt_cov_j)) + eps)
+                jac_log_det = torch.log(torch.abs(torch.linalg.det(jt_j)) + predictions.new_tensor(eps))
+                cov_log_det = torch.log(torch.abs(torch.linalg.det(jt_cov_j)) + predictions.new_tensor(eps))
 
-            cov_det_loss = tf.subtract(cov_log_det, tf.scalar_mul(2.0, jac_log_det))
+            cov_det_loss = torch.subtract(cov_log_det, 2.0 * jac_log_det)
 
     else:
         # dividing by the jac_det (for info inequality) does not work...
@@ -395,17 +367,17 @@ def delta_loss(
             f"You are using use_log_det=False. Only the determinant of the covariance matrix will be"
             f" optimized. This loss might be unbouned and could lead to unstable training."
         )
-        cov_det_loss = tf.linalg.det(cov)
+        cov_det_loss = torch.linalg.det(cov)
 
     if weights is not None:
         # normalize the weights
-        weights = tf.divide(weights, tf.reduce_sum(weights))
+        weights = torch.as_tensor(weights, dtype=predictions.dtype, device=predictions.device); weights = torch.divide(weights, torch.sum(weights).clamp_min(predictions.new_tensor(eps)))
         # do a weighted mean
-        cov_det_loss = tf.multiply(weights, cov_det_loss)
+        cov_det_loss = torch.multiply(weights, cov_det_loss)
 
     # normal mean, this is taken if the output dimension of the summary statistic is different than the number of
     # parameters. So nothing happens here if n_output = n_params, because then cov_det only has one entry.
-    cov_det_loss = tf.reduce_mean(cov_det_loss)
+    cov_det_loss = torch.mean(cov_det_loss)
     summary.write_summary(
         "loss/delta_cov_det" + summary_suffix, cov_det_loss, summary_writer, training, print_scalar=print_scalar
     )
@@ -417,14 +389,14 @@ def delta_loss(
         if cov_loss:
             jac_label = "loss/delta_covariance"
 
-            diff = tf.subtract(cov, tf.expand_dims(tf.eye(n_output, n_output, dtype=current_float), axis=0))
-            jac_loss = tf.reduce_mean(tf.square(diff), axis=(1, 2))
+            diff = torch.subtract(cov, torch.eye(n_output, n_output, dtype=predictions.dtype, device=predictions.device).unsqueeze(0))
+            jac_loss = torch.mean(torch.square(diff), dim=(1, 2))
 
             # add loss to the inverse
-            diff = tf.subtract(
-                tf.linalg.inv(cov), tf.expand_dims(tf.eye(n_output, n_output, dtype=current_float), axis=0)
+            diff = torch.subtract(
+                torch.linalg.inv(cov), torch.eye(n_output, n_output, dtype=predictions.dtype, device=predictions.device).unsqueeze(0)
             )
-            jac_loss += tf.reduce_mean(tf.square(diff), axis=(1, 2))
+            jac_loss += torch.mean(torch.square(diff), dim=(1, 2))
             jac_loss *= 0.5
 
         # NOTE this is the default branch
@@ -432,38 +404,38 @@ def delta_loss(
             jac_label = "loss/delta_jacobian"
 
             # shape (n_output/n_params, n_output, n_output)
-            diff = tf.subtract(jacobian, tf.expand_dims(tf.eye(n_output, n_params, dtype=current_float), axis=0))
+            diff = torch.subtract(jacobian, torch.eye(n_output, n_params, dtype=predictions.dtype, device=predictions.device).unsqueeze(0))
             if n_partial is None:
                 # use everything
-                jac_loss = tf.reduce_mean(tf.square(diff), axis=(1, 2))
+                jac_loss = torch.mean(torch.square(diff), dim=(1, 2))
             else:
                 # only n_part
-                jac_loss = tf.reduce_mean(tf.square(diff)[:, :, :n_partial], axis=(1, 2))
+                jac_loss = torch.mean(torch.square(diff)[:, :, :n_partial], dim=(1, 2))
 
         if weights is not None:
-            jac_loss = tf.multiply(weights, jac_loss)
+            jac_loss = torch.multiply(weights, jac_loss)
 
-        jac_loss = tf.reduce_mean(jac_loss)
-        jac_loss = tf.scalar_mul(jac_weight, jac_loss)
+        jac_loss = torch.mean(jac_loss)
+        jac_loss = jac_weight * jac_loss
 
         summary.write_summary(
             jac_label + summary_suffix, jac_loss, summary_writer, training, print_scalar=print_scalar
         )
-        loss = tf.add(loss, jac_loss)
+        loss = torch.add(loss, jac_loss)
 
     # condition number loss
     if jac_cond_weight is not None:
         if n_partial is not None:
-            c = tf_matrix_condition(jacobian[..., :n_partial])
+            c = torch_matrix_condition(jacobian[..., :n_partial])
 
         else:
-            c = tf_matrix_condition(jacobian)
+            c = torch_matrix_condition(jacobian)
 
         if weights is not None:
-            c = tf.multiply(weights, c)
+            c = torch.multiply(weights, c)
 
-        jac_cond_loss = tf.reduce_mean(c)
-        jac_cond_loss = tf.scalar_mul(jac_cond_weight, jac_cond_loss)
+        jac_cond_loss = torch.mean(c)
+        jac_cond_loss = jac_cond_weight * jac_cond_loss
 
         summary.write_summary(
             "loss/delta_jacobian_cond" + summary_suffix,
@@ -472,41 +444,35 @@ def delta_loss(
             training,
             print_scalar=print_scalar,
         )
-        loss = tf.add(loss, jac_cond_loss)
+        loss = torch.add(loss, jac_cond_loss)
 
     # diff loss
     if (force_params_value is not None) and (force_params_weight is not None):
         # calculate square distance between fidu mean and preds
-        mid_params = tf.split(predictions, num_or_size_splits=2 * n_params + 1, axis=0)[0]
+        mid_params = torch.chunk(predictions, chunks=2 * n_params + 1, dim=0)[0]
 
         # reshape
-        mid_params = tf.reshape(mid_params, shape=[-1, n_same, n_output])
+        mid_params = torch.reshape(mid_params, shape=(-1, n_same, n_output))
 
         # penalty
-        diff = tf.subtract(mid_params, force_params_value)
-        diff_loss = tf.square(tf.reduce_mean(diff, axis=1))
+        diff = torch.subtract(mid_params, force_params_value)
+        diff_loss = torch.square(torch.mean(diff, dim=1))
 
         if weights is not None:
             # reduce mean over the last axis (n params)
-            diff_loss = tf.reduce_mean(diff_loss, axis=1)
+            diff_loss = torch.mean(diff_loss, dim=1)
             # weight and mean
-            diff_loss = tf.multiply(diff_loss, weights)
+            diff_loss = torch.multiply(diff_loss, weights)
 
         # simple mean reduction
-        diff_loss = tf.reduce_mean(diff_loss)
+        diff_loss = torch.mean(diff_loss)
 
         # force weight
-        diff_loss = tf.scalar_mul(force_params_weight, diff_loss)
-
-        # NOTE distributed
-        if isinstance(strategy, tf.distribute.Strategy):
-            diff_loss = tf.distribute.get_replica_context().all_reduce("MEAN", diff_loss)
-        elif isinstance(strategy, HorovodStrategy):
-            diff_loss = hvd.allreduce(diff_loss)
+        diff_loss = force_params_weight * diff_loss
 
         summary.write_summary(
             "loss/delta_diff" + summary_suffix, diff_loss, summary_writer, training, print_scalar=print_scalar
         )
-        loss = tf.add(loss, diff_loss)
+        loss = torch.add(loss, diff_loss)
 
     return loss
