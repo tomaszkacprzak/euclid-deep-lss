@@ -1,47 +1,77 @@
 import os
 import numpy as np
+import yaml
 
 from msfm.utils import input_output, logger, files
 
 LOGGER = logger.get_logger(__file__)
 
+# the loss-block keys that the legacy maps configs.yaml stream folded into dlss_conf
+_LEGACY_LOSS_KEYS = ("loss_function", "delta_loss", "likelihood_loss", "mutual_info_loss")
 
-# like https://github.com/des-science/multiprobe-simulation-forward-model/blob/main/msfm/utils/analysis.py#L21,
-# but for this repo instead of the multiprobe-simulation-forward-model one
-def load_deep_lss_config(conf=None):
-    """Loads or passes through a config
+
+def read_split_configs(probes_config, scales_config=None):
+    """Build the dlss_conf dict from the orthogonal split configs.
+
+    The split configs define disjoint top-level namespaces: probes provides ``dset.*`` and
+    scales provides ``scale_cuts.*``. Because the top-level keys do not overlap, a shallow
+    ``dict.update`` is the correct merge. The loss config is kept separate (loaded as its own
+    ``loss_conf``) in both apps and is intentionally not merged here.
 
     Args:
-        conf (str, dict, optional): Can be either a string (a config.yaml is read in), a dictionary (the config is
-            passed through) or None (the default config is loaded). Defaults to None.
-
-    Raises:
-        ValueError: When an invalid conf is passed
+        probes_config (str): path to the probes config (required).
+        scales_config (str, optional): path to the scales config. Merged in if given.
 
     Returns:
-        dict: A configuration dictionary
+        dict: the merged dlss_conf (``dset`` + ``scale_cuts``).
     """
-    # load the default config within this repo
-    if conf is None:
-        file_dir = os.path.dirname(__file__)
-        repo_dir = os.path.abspath(os.path.join(file_dir, "../.."))
-        conf = os.path.join(repo_dir, "configs/dlss_config.yaml")
-        LOGGER.warning(f"Loading the default config from {conf}")
-        conf = input_output.read_yaml(conf)
+    dlss_conf = input_output.read_yaml(probes_config)
+    if scales_config:
+        dlss_conf.update(input_output.read_yaml(scales_config))
+    LOGGER.info("Loaded the split configs")
+    return dlss_conf
 
-    # load a config specified by a path
-    elif isinstance(conf, str):
-        conf = input_output.read_yaml(conf)
 
-    # pass through an existing config
-    elif isinstance(conf, dict):
-        pass
+def load_run_configs(path):
+    """Load a saved run's ``configs.yaml`` into the nested layout, migrating legacy streams.
 
-    else:
-        raise ValueError(f"conf {conf} must be None, a str specifying the path to the .yaml file, or the read dict")
+    The current format is a single nested mapping with keys
+    ``{net|mlp, dlss, loss, data, msfm, run}``. Older maps runs saved a positional 3-document
+    stream ``[net (+run), dlss (loss merged in), msfm]`` with the train/test split living inside
+    ``net["dset"]`` rather than in a separate ``data`` block. This loader normalizes that legacy
+    shape so the restore/eval code only ever sees the nested layout. (Legacy 4-document cls
+    streams are never reloaded, so they are not handled here.)
 
-    LOGGER.info(f"Loaded the config")
-    return conf
+    Args:
+        path (str): path to the saved ``configs.yaml``.
+
+    Returns:
+        dict: the nested config mapping.
+    """
+    with open(path, "r") as f:
+        docs = list(yaml.safe_load_all(f))
+
+    if len(docs) == 1 and isinstance(docs[0], dict) and "dlss" in docs[0]:
+        return docs[0]
+
+    # legacy 3-document maps stream
+    net_conf, dlss_conf, msfm_conf = docs
+    run_conf = net_conf.pop("run", {})
+    loss_conf = {k: dlss_conf.pop(k) for k in _LEGACY_LOSS_KEYS if k in dlss_conf}
+    eval_common = net_conf["dset"]["eval"]["common"]
+    data_conf = {
+        "signal_indices": eval_common.get("signal_indices", 0.8),
+        "noise_indices": eval_common.get("noise_indices", None),
+    }
+    LOGGER.warning("Migrated a legacy 3-document configs.yaml to the nested layout")
+    return {
+        "net": net_conf,
+        "dlss": dlss_conf,
+        "loss": loss_conf,
+        "data": data_conf,
+        "msfm": msfm_conf,
+        "run": run_conf,
+    }
 
 
 def get_smooth_nside_indices(indices_nside_in, nside_in, smooth_nside):
@@ -236,7 +266,8 @@ def get_cls_bounds_per_pair(msfm_conf, dlss_conf):
     with_clustering = dset_common["with_clustering"]
     n_z_lensing = len(msfm_conf["survey"]["metacal"]["z_bins"]) if with_lensing else 0
     n_z_clustering = len(msfm_conf["survey"]["maglim"]["z_bins"]) if with_clustering else 0
-    with_cross_probe = with_lensing and with_clustering
+    with_cross_probe = dset_common.get("with_cross_probe", with_lensing and with_clustering)
+    ggl_only = dset_common.get("ggl_only", False)
 
     _DEFAULT_L_MIN = 30
 
@@ -253,8 +284,9 @@ def get_cls_bounds_per_pair(msfm_conf, dlss_conf):
         n_z_clustering,
         with_lensing=with_lensing,
         with_clustering=with_clustering,
-        with_cross_z=True,
+        with_cross_z=dset_common.get("with_cross_z", True),
         with_cross_probe=with_cross_probe,
+        ggl_only=ggl_only,
     )
     n_z_cross = len(names)
 
