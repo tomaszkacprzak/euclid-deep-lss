@@ -103,7 +103,7 @@ def get_smooth_nside_indices(indices_nside_in, nside_in, smooth_nside):
 
 
 def get_smoothing_kwargs(loss_function, msfm_conf, dlss_conf, net_conf, dir_base=None, mode="training"):
-    """Build a dictionary of keyword arguments for the deepsphere.healpy_layers.HealpySmoothing layer.
+    """Build keyword arguments for the project-level HEALPix smoothing adapter.
 
     Args:
         loss_function (str): One of "delta", "mse", "likelihood", "mutual_info"
@@ -113,7 +113,7 @@ def get_smoothing_kwargs(loss_function, msfm_conf, dlss_conf, net_conf, dir_base
         dir_base (str, optional): Directory to store the smoothing kernel. Defaults to None.
 
     Returns:
-        dict: keyword arguments for deepsphere.healpy_layers.HealpySmoothing
+        dict: keyword arguments for deep_lss.nets.deepsphere_torch.HealpySmoothing or an equivalent PyTorch preprocessing transform
     """
     # msfm
     n_side = msfm_conf["analysis"]["n_side"]

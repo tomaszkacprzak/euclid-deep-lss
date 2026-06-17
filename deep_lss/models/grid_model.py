@@ -25,7 +25,7 @@ LOGGER = logger.get_logger(__file__)
 
 class GridLossModel(BaseModel):
     """
-    This class subclasses the BaseModel to employ a HealpyGCNN with the information maximizing delta loss, which trains
+    This class subclasses the BaseModel to employ a MapGCNN with the information maximizing delta loss, which trains
     at the fiducial and its perturbations.
     """
 
@@ -56,7 +56,7 @@ class GridLossModel(BaseModel):
 
         Args:
             network (Union[list, torch.nn.Module]): The underlying network of the model. Can be a list of layers,
-                then a regular torch.nn.Sequential or HealpyGCNN model is initialized.
+                then a regular torch.nn.Sequential or MapGCNN model is initialized.
             n_side (int): The healpy n_side of the input.
             indices (np.ndarray): 1d array of indices, corresponding to the pixel ids of the input map footprint.
             n_neighbors (int, optional): Number of neighbors considered when building the graph, currently supported
@@ -141,7 +141,7 @@ class GridLossModel(BaseModel):
             dim_theta (int, optional): The number of cosmological parameters making up the label. Defaults to None.
             batch_size (int, optional): The batch size. Defaults to None.
             dim_x (int, optional): Input dimension of the network, must be provided if the network is not a
-                HealpyGCNN. Defaults to None.
+                MapGCNN. Defaults to None.
             dim_channels (int, optional): The number of channels. Defaults to None.
             loss (str, optional): The type of loss function to use. Defaults to "mutual_info".
             dim_summary (int, optional): The dimensionality of the summary. This is only a free parameter for the
