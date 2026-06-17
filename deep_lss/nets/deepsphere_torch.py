@@ -112,22 +112,37 @@ HealpyDownsampling = HealpixAvgPool
 HealpyChebyshev = SphericalChebConv
 
 
-class HealpySmoothing:
-    """Placeholder for the removed TensorFlow DeepSphere smoothing layer."""
+class _UnavailableDeepSphereLayer:
+    """Deferred-error module for DeepSphere layers not present in the PyTorch API."""
 
     def __init__(self, *args, **kwargs):
-        raise NotImplementedError(
-            "HealpySmoothing was provided by the old TensorFlow DeepSphere package. "
-            "Use a PyTorch-native preprocessing/smoothing transform before constructing runtime models."
-        )
+        nn = importlib.import_module("torch.nn")
+
+        class _Layer(nn.Module):
+            def __init__(self, args, kwargs):
+                super().__init__()
+                self.args = args
+                self.kwargs = kwargs
+
+            def forward(self, *inputs, **forward_kwargs):
+                raise NotImplementedError(
+                    "This TensorFlow DeepSphere layer is not available in the standardized PyTorch DeepSphere API. "
+                    "Construct an equivalent torch.nn.Module and import PyTorch DeepSphere primitives from "
+                    "deep_lss.nets.deepsphere_torch."
+                )
+
+        self.module = _Layer(args, kwargs)
+
+    def __call__(self):
+        return self.module
+
+
+def HealpySmoothing(*args, **kwargs):
+    return _UnavailableDeepSphereLayer(*args, **kwargs)()
 
 
 def _legacy_layer(*args, **kwargs):
-    raise NotImplementedError(
-        "This TensorFlow DeepSphere layer is not available in the standardized PyTorch DeepSphere API. "
-        "Construct an equivalent torch.nn.Module and import PyTorch DeepSphere primitives from "
-        "deep_lss.nets.deepsphere_torch."
-    )
+    return _UnavailableDeepSphereLayer(*args, **kwargs)()
 
 
 healpy_layers = SimpleNamespace(

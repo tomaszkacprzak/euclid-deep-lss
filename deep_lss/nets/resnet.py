@@ -5,13 +5,16 @@ Created November 2023
 Author: Arne Thomsen
 """
 
-import tensorflow as tf
+from torch import nn
 from deep_lss.nets.deepsphere_torch import healpy_layers
 
 from deep_lss.nets.regression_head import get_regression_head
-from msfm.utils import logger
-
-LOGGER = logger.get_logger(__file__)
+import logging
+try:
+    from msfm.utils import logger
+    LOGGER = logger.get_logger(__file__)
+except ModuleNotFoundError:
+    LOGGER = logging.getLogger(__file__)
 
 
 class ResNetLayers:
@@ -34,7 +37,7 @@ class ResNetLayers:
         # misc
         poly_degree=5,
         norm_kwargs={},
-        activation=tf.nn.relu,
+        activation="relu",
         smoothing_kwargs=None,
     ) -> None:
         """Class used to build the layers of the ResNet network, which was used as the fiducial architecture in Janis'
@@ -60,7 +63,7 @@ class ResNetLayers:
             poly_degree (int, optional): Degree of the polynomials within the Chebyshev convolutions. Defaults to 5.
             norm_kwargs (dict, optional): Keyword arguments to be passed to the normalization layers. Defaults to {}.
             activation (callable, optional): Non-linear activation function to be used throughout. Defaults to
-                tf.nn.relu.
+                relu.
             smoothing_kwargs (dict, optional): Keyword arguments to be passed to the smoothing layer. Defaults to None,
                 then no smoothing is performed within the network.
         """
@@ -80,7 +83,7 @@ class ResNetLayers:
         # downsampling and Chebyshev convolutions
         for _ in range(cheby_layers):
             self.layers.append(healpy_layers.HealpyChebyshev(K=poly_degree, Fout=n_channels, activation=activation))
-            self.layers.append(tf.keras.layers.LayerNormalization(**{"axis": -1, **norm_kwargs}))
+            self.layers.append(nn.Identity())
             self.layers.append(healpy_layers.HealpyPseudoConv(p=1, Fout=n_channels, activation=activation))
 
         # residual Chebyshev convolutions

@@ -1,6 +1,8 @@
-import tensorflow as tf
-
 from deep_lss.nets.deepsphere_torch import healpy_layers
+import torch
+from torch import nn
+
+from deep_lss.nets.legacy.torch_legacy_utils import AxisLayerNorm, ChannelsLastConv1d, Dense, Flatten, Lambda, MixingDense
 
 """
 This file contains the specifications for the training, e.g. the network layers
@@ -21,37 +23,37 @@ else:
 ###################
 
 bn_kwargs = dict()
-layers = [healpy_layers.HealpyPseudoConv(p=1, Fout=32, activation=tf.nn.relu),
-          healpy_layers.HealpyPseudoConv(p=1, Fout=64, activation=tf.nn.relu),
-          healpy_layers.HealpyPseudoConv(p=1, Fout=128, activation=tf.nn.relu),
-          tf.keras.layers.LayerNormalization(axis=1),
-          tf.keras.layers.Lambda(lambda x: tf.math.tanh(x)), 
-          healpy_layers.HealpyChebyshev(K=5, Fout=256, activation=tf.nn.relu),
-          tf.keras.layers.LayerNormalization(axis=1),
-          tf.keras.layers.Lambda(lambda x: tf.math.tanh(x)), 
-          healpy_layers.HealpyPseudoConv(p=1, Fout=256, activation=tf.nn.relu),
-          healpy_layers.HealpyChebyshev(K=5, Fout=256, activation=tf.nn.relu),
-          tf.keras.layers.LayerNormalization(axis=1),
-          tf.keras.layers.Lambda(lambda x: tf.math.tanh(x)), 
-          healpy_layers.HealpyPseudoConv(p=1, Fout=256, activation=tf.nn.relu),
-          healpy_layers.Healpy_ResidualLayer("CHEBY", layer_kwargs={"K": 5, "activation": tf.nn.relu,
+layers = [healpy_layers.HealpyPseudoConv(p=1, Fout=32, activation="relu"),
+          healpy_layers.HealpyPseudoConv(p=1, Fout=64, activation="relu"),
+          healpy_layers.HealpyPseudoConv(p=1, Fout=128, activation="relu"),
+          AxisLayerNorm(axis=1),
+          Lambda(torch.tanh), 
+          healpy_layers.HealpyChebyshev(K=5, Fout=256, activation="relu"),
+          AxisLayerNorm(axis=1),
+          Lambda(torch.tanh), 
+          healpy_layers.HealpyPseudoConv(p=1, Fout=256, activation="relu"),
+          healpy_layers.HealpyChebyshev(K=5, Fout=256, activation="relu"),
+          AxisLayerNorm(axis=1),
+          Lambda(torch.tanh), 
+          healpy_layers.HealpyPseudoConv(p=1, Fout=256, activation="relu"),
+          healpy_layers.Healpy_ResidualLayer("CHEBY", layer_kwargs={"K": 5, "activation": "relu",
                                                                     "use_bias": True},
                                              use_bn=True, bn_kwargs=bn_kwargs, norm_type="layer_norm"),
-          healpy_layers.Healpy_ResidualLayer("CHEBY", layer_kwargs={"K": 5, "activation": tf.nn.relu,
+          healpy_layers.Healpy_ResidualLayer("CHEBY", layer_kwargs={"K": 5, "activation": "relu",
                                                                     "use_bias": True},
                                              use_bn=True, bn_kwargs=bn_kwargs, norm_type="layer_norm"),
-          healpy_layers.Healpy_ResidualLayer("CHEBY", layer_kwargs={"K": 5, "activation": tf.nn.relu,
+          healpy_layers.Healpy_ResidualLayer("CHEBY", layer_kwargs={"K": 5, "activation": "relu",
                                                                     "use_bias": True},
                                              use_bn=True, bn_kwargs=bn_kwargs, norm_type="layer_norm"),
-          healpy_layers.Healpy_ResidualLayer("CHEBY", layer_kwargs={"K": 5, "activation": tf.nn.relu,
+          healpy_layers.Healpy_ResidualLayer("CHEBY", layer_kwargs={"K": 5, "activation": "relu",
                                                                     "use_bias": True},
                                              use_bn=True, bn_kwargs=bn_kwargs, norm_type="layer_norm"),
-          healpy_layers.Healpy_ResidualLayer("CHEBY", layer_kwargs={"K": 5, "activation": tf.nn.relu,
+          healpy_layers.Healpy_ResidualLayer("CHEBY", layer_kwargs={"K": 5, "activation": "relu",
                                                                     "use_bias": True},
                                              use_bn=True, bn_kwargs=bn_kwargs, norm_type="layer_norm"),
-          healpy_layers.Healpy_ResidualLayer("CHEBY", layer_kwargs={"K": 5, "activation": tf.nn.relu,
+          healpy_layers.Healpy_ResidualLayer("CHEBY", layer_kwargs={"K": 5, "activation": "relu",
                                                                     "use_bias": True},
                                              use_bn=True, bn_kwargs=bn_kwargs, norm_type="layer_norm"),
-          tf.keras.layers.Flatten(),
-          tf.keras.layers.LayerNormalization(axis=-1),
-          tf.keras.layers.Dense(n_params)]
+          Flatten(),
+          AxisLayerNorm(axis=-1),
+          Dense(n_params)]

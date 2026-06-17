@@ -1,96 +1,48 @@
-# Copyright (C) 2024 ETH Zurich, Institute for Particle Physics and Astrophysics
-
-"""
-Created August 2024
-Author: Arne Thomsen
-"""
-
-import tensorflow as tf
-import tensorflow_probability as tfp
-
-tfd = tfp.distributions
+import torch
+from torch import nn
+from torch.distributions import Categorical, MixtureSameFamily, MultivariateNormal, Independent, Normal
+from deep_lss.nets.torch_utils import LinearActivation
 
 
-class GaussianMixtureModel:
-    def __init__(
-        self,
-        dim_theta,
-        dim_summary,
-        num_components,
-        num_hidden_layers=2,
-        num_hidden_units=128,
-        activation="relu",
-        full_covariance=True,
-        diagonal_eps=1e-5,
-    ):
-        self.dim_theta = dim_theta
-        self.dim_summary = dim_summary
-        self.num_components = num_components
-        self.num_hidden_layers = num_hidden_layers
-        self.num_hidden_units = num_hidden_units
-        self.activation = activation
-        self.full_covariance = full_covariance
-        self.diagonal_eps = diagonal_eps
+class GaussianMixtureModel(nn.Module):
+    def __init__(self, dim_theta, dim_summary, num_components, num_hidden_layers=2, num_hidden_units=128,
+                 activation="relu", full_covariance=True, diagonal_eps=1e-5):
+        super().__init__()
+        self.dim_theta = dim_theta; self.dim_summary = dim_summary; self.num_components = num_components
+        self.full_covariance = full_covariance; self.diagonal_eps = diagonal_eps
+        self.mixture_logits_net = self._build_network(num_components, num_hidden_layers, num_hidden_units, activation)
+        self.loc_net = self._build_network(num_components * dim_theta, num_hidden_layers, num_hidden_units, activation)
+        self.tril_size = (dim_theta * (dim_theta + 1)) // 2
+        out = num_components * (self.tril_size if full_covariance else dim_theta)
+        self.scale_net = self._build_network(out, num_hidden_layers, num_hidden_units, activation)
 
-        self.mixture_logits_net = self._build_network(output_size=num_components)
-        self.loc_net = self._build_network(output_size=num_components * dim_theta)
+    def _build_network(self, output_size, num_hidden_layers, num_hidden_units, activation):
+        layers = []; last = self.dim_summary
+        for _ in range(num_hidden_layers):
+            layers.append(LinearActivation(num_hidden_units, activation=activation, in_features=last)); last = num_hidden_units
+        layers.append(nn.Linear(last, output_size)); return nn.Sequential(*layers)
 
+    def _params(self, summary):
+        summary = summary.float()
+        logits = self.mixture_logits_net(summary).float()
+        loc = self.loc_net(summary).reshape(-1, self.num_components, self.dim_theta).float()
         if self.full_covariance:
-            self.tril_size = (dim_theta * (dim_theta + 1)) // 2
-            self.scale_net = self._build_network(output_size=num_components * self.tril_size)
+            raw = self.scale_net(summary).reshape(-1, self.num_components, self.tril_size)
+            tril = torch.zeros(raw.shape[0], self.num_components, self.dim_theta, self.dim_theta, device=raw.device, dtype=raw.dtype)
+            idx = torch.tril_indices(self.dim_theta, self.dim_theta, device=raw.device)
+            tril[..., idx[0], idx[1]] = raw
+            diag = torch.diagonal(tril, dim1=-2, dim2=-1)
+            diag.copy_(torch.nn.functional.softplus(diag) + self.diagonal_eps)
+            comp = MultivariateNormal(loc, scale_tril=tril.float())
         else:
-            self.scale_net = self._build_network(output_size=num_components * dim_theta)
-            self.scale_net.add(tf.keras.layers.Activation("softplus"))
-
-    def _build_network(self, output_size):
-        layers = [tf.keras.layers.InputLayer(input_shape=(self.dim_summary,))]
-
-        for _ in range(self.num_hidden_layers):
-            layers.append(tf.keras.layers.Dense(self.num_hidden_units, activation=self.activation))
-
-        layers.append(tf.keras.layers.Dense(output_size))
-
-        return tf.keras.Sequential(layers)
+            scale = torch.nn.functional.softplus(self.scale_net(summary).reshape(-1, self.num_components, self.dim_theta)) + self.diagonal_eps
+            comp = Independent(Normal(loc, scale), 1)
+        return logits, loc, comp
 
     def log_prob(self, theta, summary):
-        """p(theta | summary)"""
-
-        mixture_logits = self.mixture_logits_net(summary)  # (batch_size, num_components)
-        mixture_logits = tf.cast(mixture_logits, tf.float32)
-
-        loc = self.loc_net(summary)  # (batch_size, num_components * dim_theta)
-        loc = tf.cast(tf.reshape(loc, [-1, self.num_components, self.dim_theta]), tf.float32)
-
-        if self.full_covariance:
-            scale_tril = self.scale_net(summary)  # (batch_size, num_components * tril_size)
-            scale_tril = tf.reshape(scale_tril, [-1, self.num_components, self.tril_size])
-            scale_tril = tfp.math.fill_triangular(scale_tril)  # [-1, K, D, D]
-            # Ensure strictly positive diagonal so the Cholesky factor is valid.
-            # Raw network output is unbounded; zero or negative diagonal causes log(|diag|) → -inf
-            # and a singular inverse → NaN loss → NaN gradients → corrupted weights.
-            scale_tril = tf.linalg.set_diag(
-                scale_tril, tf.nn.softplus(tf.linalg.diag_part(scale_tril)) + self.diagonal_eps
-            )
-            scale_tril = tf.cast(tf.reshape(scale_tril, [-1, self.num_components, self.dim_theta, self.dim_theta]), tf.float32)
-            component_distribution = tfd.MultivariateNormalTriL(loc=loc, scale_tril=scale_tril)
-        else:
-            scale = self.scale_net(summary)  # (batch_size, num_components * dim_theta)
-            scale = tf.cast(tf.reshape(scale, [-1, self.num_components, self.dim_theta]), tf.float32)
-            component_distribution = tfd.MultivariateNormalDiag(loc=loc, scale_diag=scale)
-
-        mixture_distribution = tfd.Categorical(logits=mixture_logits)
-
-        gmm = tfd.MixtureSameFamily(
-            mixture_distribution=mixture_distribution, components_distribution=component_distribution
-        )
-
-        theta = tf.cast(theta, tf.float32)
-
-        return gmm.log_prob(theta)
+        logits, _, comp = self._params(summary)
+        return MixtureSameFamily(Categorical(logits=logits), comp).log_prob(theta.float())
 
     def mean(self, summary):
-        """Posterior mean E[θ|summary] = Σ_k w_k(summary) * μ_k(summary)"""
-        mixture_logits = tf.cast(self.mixture_logits_net(summary), tf.float32)
-        loc = tf.cast(tf.reshape(self.loc_net(summary), [-1, self.num_components, self.dim_theta]), tf.float32)
-        weights = tf.nn.softmax(mixture_logits, axis=-1)  # [B, K]
-        return tf.reduce_sum(weights[:, :, tf.newaxis] * loc, axis=1)  # [B, D]
+        logits, loc, _ = self._params(summary)
+        return (torch.softmax(logits, dim=-1)[:, :, None] * loc).sum(dim=1)
