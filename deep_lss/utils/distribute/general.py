@@ -1,59 +1,45 @@
 # Copyright (C) 2023 ETH Zurich, Institute for Particle Physics and Astrophysics
 
-"""
-Created March 2023
-Author: Arne Thomsen
+"""Utils for distributed training with PyTorch."""
 
-Utils for distributed training with tf.distribute and horovod.
-"""
+from __future__ import annotations
 
-import tensorflow as tf
-import os, wandb
+import os
 
-from deep_lss.utils.distribute import tensorflow, horovod
+import torch
+import torch.distributed as dist
+import wandb
 
+from deep_lss.utils.distribute.torch import TorchDistributedContext, setup_torch_distributed
 from msfm.utils import logger
 
 LOGGER = logger.get_logger(__file__)
 
 
 def get_strategy(strategy_name=None):
-    """Returns a tf.distribute.Strategy or (custom) HorovodStrategy instance.
+    """Return a PyTorch distribution context.
 
     Args:
-        strategy_name (str, optional): The distribution strategy to use. Valid values are 'mirrored',
-            'multi_worker_mirrored' and 'horovod'. Defaults to None, then the builtin default strategy is used.
+        strategy_name (str, optional): One of ``None``/``"none"``, ``"single_gpu"``, or ``"ddp"``.
 
     Returns:
-        tf.distribute.Strategy: The distribution strategy.
+        TorchDistributedContext: Context with rank/world-size metadata plus helpers for DDP.
     """
     try:
         n_tasks = int(os.environ["SLURM_NTASKS"])
         LOGGER.info(f"Running on {n_tasks} tasks in total")
     except KeyError:
-        LOGGER.info(f"Running locally as SLURM_NTASKS is not set")
+        LOGGER.info("Running locally as SLURM_NTASKS is not set")
 
-    if strategy_name is None:
-        strategy = tf.distribute.get_strategy()
-        LOGGER.warning(f"Training is not distributed, using the default strategy")
-    elif strategy_name == "mirrored":
-        strategy = tensorflow.setup_tf_distribute_mirrored_strategy()
-    elif strategy_name == "multi_worker_mirrored":
-        strategy = tensorflow.setup_tf_distribute_multi_worker_mirrored_strategy()
-    elif strategy_name == "horovod":
-        strategy = horovod.setup_horovod()
-    else:
-        ValueError(f"Unknown distribution strategy {strategy_name}")
-
-    return strategy
+    if strategy_name in (None, "none"):
+        return setup_torch_distributed("none")
+    if strategy_name in ("single_gpu", "ddp"):
+        return setup_torch_distributed(strategy_name)
+    raise ValueError(f"Unknown distribution strategy {strategy_name}")
 
 
 def check_devices():
-    """Logs the number of discovered CPUs and GPUs
-
-    Returns:
-        (int, int): CPU core count, GPU device count
-    """
+    """Logs the number of discovered CPUs and GPUs using PyTorch."""
     try:
         n_cpus = len(os.sched_getaffinity(0))
         if n_cpus != os.cpu_count():
@@ -65,88 +51,64 @@ def check_devices():
         n_cpus = os.cpu_count()
     LOGGER.info(f"Running on {n_cpus} CPU cores")
 
-    n_gpus = len(tf.config.list_physical_devices("GPU"))
+    n_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
     if n_gpus == 0:
-        LOGGER.warning(f"No GPU discovered by TensorFlow, running on CPUs only")
+        LOGGER.warning("No GPU discovered by PyTorch, running on CPUs only")
     else:
         LOGGER.info(f"Individual task(s) running on {n_gpus} GPU(s)")
 
     try:
         n_gpus_cuda = len(os.environ["CUDA_VISIBLE_DEVICES"].split(","))
-        assert (
-            n_gpus == n_gpus_cuda
-        ), f"The number of GPUs in TensorFlow {n_gpus} and CUDA {n_gpus_cuda} should be equal"
+        assert n_gpus == n_gpus_cuda, f"The number of GPUs in PyTorch {n_gpus} and CUDA {n_gpus_cuda} should be equal"
     except KeyError:
         if n_gpus == 0:
-            LOGGER.warning(f"No CUDA enabled GPUs found")
+            LOGGER.warning("No CUDA enabled GPUs found")
 
     return n_cpus, n_gpus
 
 
+def get_world_size(strategy=None):
+    if strategy is not None and hasattr(strategy, "world_size"):
+        return int(strategy.world_size)
+    if dist.is_available() and dist.is_initialized():
+        return dist.get_world_size()
+    return 1
+
+
+def get_rank(strategy=None):
+    if strategy is not None and hasattr(strategy, "rank"):
+        return int(strategy.rank)
+    if dist.is_available() and dist.is_initialized():
+        return dist.get_rank()
+    return 0
+
+
 def get_local_batch_size(strategy, global_batch_size):
-    """Calculates the local (per replica) batch size given a strategy and global batch size
-
-    Args:
-        strategy (tf.distribute.Strategy): The instance of the strategy.
-        global_batch_size (int): Batch size over all of the replicas.
-
-    Raises:
-        ValueError: If the global batch size is not divisible by the number of replicas
-
-    Returns:
-        int: The per replica batch size
-    """
-    n_replicas = strategy.num_replicas_in_sync
-
-    # adjust the batch size to the strategy
-    if global_batch_size % n_replicas == 0:
-        local_batch_size = global_batch_size // n_replicas
-        LOGGER.info(f"Using the local batch size {local_batch_size}")
-    else:
+    """Calculate per-rank batch size from global batch size and PyTorch world size."""
+    world_size = get_world_size(strategy)
+    if global_batch_size % world_size != 0:
         raise ValueError(
-            f"The global batch size {global_batch_size} has to be divisible by the number of synced replicas {n_replicas}"
+            f"The global batch size {global_batch_size} has to be divisible by the PyTorch world size {world_size}"
         )
-
+    local_batch_size = global_batch_size // world_size
+    LOGGER.info(f"Using the local batch size {local_batch_size} on rank {get_rank(strategy)}")
     return local_batch_size
 
 
 def get_global_batch_size(strategy, local_batch_size):
-    """Calculates the global (accross all replicas) batch size given a strategy and local batch size
-
-    Args:
-        strategy (tf.distribute.Strategy): The instance of the strategy.
-        local_batch_size (int): Batch size of a single replica.
-
-    Returns:
-        int: The global batch size over all replicas
-    """
-    n_replicas = strategy.num_replicas_in_sync
-
-    global_batch_size = int(local_batch_size * n_replicas)
+    """Calculate global batch size from per-rank batch size and PyTorch world size."""
+    world_size = get_world_size(strategy)
+    global_batch_size = int(local_batch_size * world_size)
     LOGGER.info(f"Using the global batch size {global_batch_size}")
-
     return global_batch_size
 
 
 def get_wandb_group_name(strategy):
-    """Generate a group name that is unique for each run and the same for all replicas in a distributed run.
-
-    Args:
-        strategy (tf.distribute.Strategy): The instance of the strategy.
-
-    Returns:
-        str: The group name to use.
-    """
-    if isinstance(strategy, tf.distribute.MultiWorkerMirroredStrategy):
-        group_name = wandb.util.generate_id()
-        LOGGER.info(f"group = {group_name}")
-    elif isinstance(strategy, horovod.HorovodStrategy):
-        # can't broadcast a tf.string tensor, so generate a number and broadcast that
-        group_name = tf.random.uniform(shape=(), minval=1, maxval=int(1e8), dtype=tf.int32)
-        group_name = strategy.broadcast(group_name, root_rank=0)
-        group_name = str(group_name.numpy())
-        LOGGER.info(f"group = {group_name}")
-    else:
-        group_name = None
-
+    """Generate a W&B group shared by all ranks in a distributed run."""
+    if get_world_size(strategy) <= 1:
+        return None
+    group_name = wandb.util.generate_id() if get_rank(strategy) == 0 else None
+    if isinstance(strategy, TorchDistributedContext):
+        group_name = strategy.broadcast_object(group_name, root_rank=0)
+    LOGGER.info(f"group = {group_name}")
     return group_name

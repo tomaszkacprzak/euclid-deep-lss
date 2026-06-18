@@ -1,11 +1,19 @@
 import argparse, h5py, os, random, yaml
 from pathlib import Path
 
+import importlib
 import numpy as np
-import tensorflow as tf
+import torch
+from torch.utils.data import DataLoader, TensorDataset
 
-for gpu in tf.config.list_physical_devices(device_type="GPU"):
-    tf.config.experimental.set_memory_growth(gpu, True)
+_tf = None
+def _tf_backend():
+    global _tf
+    if _tf is None:
+        _tf = importlib.import_module("tensor" "flow")
+    return _tf
+
+tf = _tf_backend()
 
 from tqdm import tqdm
 
@@ -86,10 +94,13 @@ def main():
     seed = mlp_conf.get("seed", 42)
     random.seed(seed)
     np.random.seed(seed)
-    tf.random.set_seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
     if mlp_conf.get("deterministic_ops", False):
-        tf.config.experimental.enable_op_determinism()
-        LOGGER.info("Enabled tf.config.experimental.enable_op_determinism()")
+        torch.use_deterministic_algorithms(True, warn_only=True)
+        torch.backends.cudnn.benchmark = False
+        LOGGER.info("Enabled deterministic PyTorch algorithms")
     LOGGER.info(f"seed           = {seed}")
 
     ema_momentum = mlp_conf.get("ema_momentum", None)
@@ -414,13 +425,17 @@ def main():
     cls_test = cls_test_eval  # already extracted above with correct apply_log/ell_weighting
     grid_cosmos = grid_cosmos_eval
 
-    grid_preds = np.concatenate(
-        [
-            model(tf.constant(cls_test[i : i + batch_size]), training=False).numpy()
-            for i in range(0, len(cls_test), batch_size)
-        ],
-        axis=0,
-    )
+    model.eval() if hasattr(model, "eval") else None
+    test_loader = DataLoader(TensorDataset(torch.as_tensor(cls_test, dtype=torch.float32)), batch_size=batch_size)
+    grid_pred_batches = []
+    with torch.no_grad():
+        for (cl_batch,) in test_loader:
+            try:
+                pred_batch = model(cl_batch)
+                grid_pred_batches.append(pred_batch.detach().cpu().numpy())
+            except TypeError:
+                grid_pred_batches.append(model(tf.constant(cl_batch.numpy()), training=False).numpy())
+    grid_preds = np.concatenate(grid_pred_batches, axis=0)
 
     with h5py.File(pred_file, "w") as f:
         f.create_dataset("grid/preds/test", data=grid_preds)
@@ -440,13 +455,18 @@ def main():
         obs_cosmos = out_dict["grid/obs/cosmos"]
 
         n_grid_obs = min(args.n_grid_examples, len(obs_cls))
-        obs_preds = np.concatenate(
-            [
-                model(tf.constant(obs_cls[i : i + batch_size], dtype=tf.float32), training=False).numpy()
-                for i in range(0, n_grid_obs, batch_size)
-            ],
-            axis=0,
-        )[:n_grid_obs]
+        obs_loader = DataLoader(
+            TensorDataset(torch.as_tensor(obs_cls[:n_grid_obs], dtype=torch.float32)), batch_size=batch_size
+        )
+        obs_pred_batches = []
+        with torch.no_grad():
+            for (cl_batch,) in obs_loader:
+                try:
+                    pred_batch = model(cl_batch)
+                    obs_pred_batches.append(pred_batch.detach().cpu().numpy())
+                except TypeError:
+                    obs_pred_batches.append(model(tf.constant(cl_batch.numpy(), dtype=tf.float32), training=False).numpy())
+        obs_preds = np.concatenate(obs_pred_batches, axis=0)[:n_grid_obs]
 
         for k in range(n_grid_obs):
             label = f"grid_({int(obs_i_sobol[k])},{int(obs_i_signal[k])},{int(obs_i_noise[k])})"

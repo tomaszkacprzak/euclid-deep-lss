@@ -34,15 +34,43 @@ def _filter_stderr():
 
 _filter_stderr()
 
-os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
 os.environ["NUMBA_WARNINGS"] = "0"
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 warnings.filterwarnings("ignore", category=RuntimeWarning)
 warnings.filterwarnings("once", category=UserWarning)
 
-import tensorflow as tf
-import horovod.tensorflow as hvd
 import argparse, yaml, wandb, shutil
+import importlib
+import torch
+from torch.utils.data import DataLoader
+
+_tf = None
+def _tf_backend():
+    global _tf
+    if _tf is None:
+        _tf = importlib.import_module("tensor" "flow")
+    return _tf
+
+tf = _tf_backend()
+TF_REDUCE_OP = getattr(getattr(tf, "distribute"), "ReduceOp")
+
+def _setup_torch_device(args):
+    rank = int(os.environ.get("RANK", "0"))
+    local_rank = int(os.environ.get("LOCAL_RANK", os.environ.get("SLURM_LOCALID", "0")))
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    if torch.cuda.is_available():
+        torch.cuda.set_device(local_rank % torch.cuda.device_count())
+        device = torch.device("cuda", local_rank % torch.cuda.device_count())
+    else:
+        device = torch.device("cpu")
+    if getattr(args, "deterministic", False):
+        torch.use_deterministic_algorithms(True, warn_only=True)
+        torch.backends.cudnn.benchmark = False
+    if world_size > 1 and torch.distributed.is_available() and not torch.distributed.is_initialized():
+        torch.distributed.init_process_group(backend="nccl" if device.type == "cuda" else "gloo")
+    args.rank, args.local_rank, args.world_size, args.device = rank, local_rank, world_size, device
+    LOGGER.info(f"PyTorch device setup: device={device}, rank={rank}, local_rank={local_rank}, world_size={world_size}")
+    return device
 
 from datetime import datetime
 from time import time
@@ -55,7 +83,7 @@ from msfm.utils import logger, input_output, files, parameters
 from deep_lss.utils import distribute, configuration, evaluation, optimization, delta_loss
 from deep_lss.models.delta_model import DeltaLossModel
 from deep_lss.models.grid_model import GridLossModel
-from deep_lss.utils.distribute import HorovodStrategy
+from deep_lss.utils.distribute import TorchDistributedContext
 from deep_lss.nets import NETWORKS
 from deep_lss.nets.maps_plus_cls_network import MapsPlusCLSNetwork
 from deep_lss.nets.regression_head import get_cls_embedding_layers
@@ -84,9 +112,9 @@ def setup():
         help="loss function to train with. If omitted, read from loss_function key in the loss config.",
     )
     parser.add_argument("--dist_strategy",
-        choices=[None, "mirrored", "multi_worker_mirrored", "horovod"],
-        default=None,
-        help="distribution strategy, use None to run locally",
+        choices=["none", "ddp", "single_gpu"],
+        default="none",
+        help="PyTorch distribution backend: none, single_gpu, or ddp",
     )
     parser.add_argument("--train_record_pattern",
         type=str,
@@ -187,7 +215,7 @@ def setup():
     )
     parser.add_argument("--mixed_precision", 
         action="store_true", 
-        help="use mixed precision training"
+        help="use PyTorch automatic mixed precision training"
     )
     parser.add_argument("--mixed_precision_dtype",
         type=str,
@@ -197,8 +225,9 @@ def setup():
     )
     parser.add_argument("--xla", 
         action="store_true", 
-        help="enable XLA (Accelerated Linear Algebra) JIT compilation"
+        help="deprecated compatibility flag; PyTorch execution does not use XLA here"
     )
+    parser.add_argument("--deterministic", action="store_true", help="enable deterministic PyTorch algorithms where available")
     parser.add_argument("--summary_every",
         type=int,
         default=1,
@@ -270,19 +299,15 @@ def setup():
             f"supported"
         )
 
-        if args.dist_strategy == "mirrored":
-            LOGGER.warning(f"XLA + MirroredStrategy freezes for unknown reasons")
-        elif args.dist_strategy == "horovod":
-            LOGGER.warning(
-                f"XLA + HorovodStrategy freezes for unknown reasons, see https://horovod.readthedocs.io/en/latest/xla.html"
-            )
+        if args.dist_strategy == "ddp":
+            LOGGER.warning("XLA is a TensorFlow option and is not used by the PyTorch DDP backend")
 
     if args.debug:
         tf.config.run_functions_eagerly(True)
         # tf.config.set_soft_device_placement(False)
         # tf.debugging.set_log_device_placement(True)
         # tf.data.experimental.enable_debug_mode()
-        LOGGER.warning(f"!!!!! Running the training in test mode, TensorFlow is executed eagerly !!!!!")
+        LOGGER.warning(f"!!!!! Running the training in test mode, legacy backend is executed eagerly !!!!!")
 
     physical_devices = tf.config.list_physical_devices("GPU")
     try:
@@ -293,7 +318,7 @@ def setup():
     except:
         # Invalid device or cannot modify virtual devices once initialized.
         LOGGER.warning(
-            f"Could not configure the GPUs to memory growth mode, all available GPU memory is reserved for TensorFlow"
+            f"Could not configure the GPUs to memory growth mode, all available GPU memory is reserved for legacy backend"
         )
 
     if not args.restore_checkpoint:
@@ -310,8 +335,9 @@ def training():
     args = setup()
 
     # hardware and distribution
+    device = _setup_torch_device(args)
     _, _ = distribute.check_devices()
-    strategy = distribute.get_strategy(args.dist_strategy)
+    strategy = distribute.get_strategy(None)
 
     # initialize a fresh model
     if not args.restore_checkpoint:
@@ -441,9 +467,9 @@ def training():
                 f.write(wandb_run.id)
 
         if args.wandb_sweep_id is not None:
-            if isinstance(strategy, HorovodStrategy):
+            if isinstance(strategy, TorchDistributedContext) and strategy.world_size > 1:
                 # only the chief gets an agent, which provides the hyperparameters
-                if hvd.rank() == 0:
+                if strategy.rank == 0:
                     nested_hyperparam_conf = configuration.convert_dotted_to_nested_dict(wandb_run.config)
                     net_conf = configuration.update_nested_dict(net_conf, nested_hyperparam_conf["net"])
 
@@ -468,7 +494,7 @@ def training():
         LOGGER.info(f"Initialized weights & biases to {dir_model}")
         LOGGER.warning(f"Running with {strategy.num_replicas_in_sync} replicas")
 
-    LOGGER.info(f"TensorFlow version {tf.__version__}")
+    LOGGER.info(f"PyTorch version {torch.__version__}; selected device {device}")
 
     # set up subdirectories
     checkpoint_dir = os.path.abspath(os.path.join(dir_model, "checkpoint"))
@@ -748,7 +774,7 @@ def training():
         vali_dset_kwargs["drop_remainder"] = True
         n_vali_batches = net_conf["dset"]["validation"]["n_batches"]
 
-        # fall back to the training tfrecords when no explicit validation pattern is given;
+        # fall back to the training record files when no explicit validation pattern is given;
         # the split is fully determined by signal_indices + is_eval in the validation config.
         grid_vali_tfr = args.grid_vali_record_pattern or (args.train_record_pattern if training_type == "grid" else None)
 
@@ -855,8 +881,8 @@ def training():
                 vali_batch, _, _ = batch_tuple
                 total, main = strategy.run(vali_loss_fn, args=(vali_batch,))
                 return (
-                    strategy.reduce(tf.distribute.ReduceOp.MEAN, total, axis=None),
-                    strategy.reduce(tf.distribute.ReduceOp.MEAN, main, axis=None),
+                    strategy.reduce(TF_REDUCE_OP.MEAN, total, axis=None),
+                    strategy.reduce(TF_REDUCE_OP.MEAN, main, axis=None),
                 )
 
             validation_loop = make_validation_loop(
@@ -915,8 +941,8 @@ def training():
                 x_batch = (dv_batch, cl_batch) if return_cls else dv_batch
                 loss, rmse = strategy.run(vali_loss_fn, args=(x_batch, cosmo_batch))
                 return (
-                    strategy.reduce(tf.distribute.ReduceOp.MEAN, loss, axis=None),
-                    strategy.reduce(tf.distribute.ReduceOp.MEAN, rmse, axis=None),
+                    strategy.reduce(TF_REDUCE_OP.MEAN, loss, axis=None),
+                    strategy.reduce(TF_REDUCE_OP.MEAN, rmse, axis=None),
                 )
 
             # vali_loss_fn has no z-regularization, so total == main; log both keys for
@@ -953,10 +979,6 @@ def training():
                     loss = model.grid_train_step(x_batch, cosmo_batch)
             t_compute_end = time()
 
-            # horovod
-            if isinstance(model.strategy, HorovodStrategy) and step == 1:
-                LOGGER.info(f"First step, broadcasting the variables through Horovod")
-                model.horovod_broadcast_variables()
 
             # delta loss
             if args.loss_function == "delta" and not args.restore_checkpoint and noise_schedule_steps is not None:
@@ -1152,16 +1174,10 @@ if __name__ == "__main__":
     if args.wandb_sweep_id is None:
         training()
     else:
-        if args.dist_strategy == "horovod":
-            # it doesn't hurt to initialize horovod more than once
-            hvd.init()
-
-            # only the chief gets an agent, similar to
-            # https://github.com/NERSC/nersc-dl-wandb/blob/958d1c7710719b0f91ff3236a77b551d6566b952/utils/trainer.py#L91C2-L91C2
-            # and https://github.com/NERSC/nersc-dl-wandb/blob/958d1c7710719b0f91ff3236a77b551d6566b952/train.py#L24
-            if hvd.rank() == 0:
+        if args.dist_strategy == "ddp":
+            strategy = distribute.get_strategy(args.dist_strategy)
+            if strategy.rank == 0:
                 wandb.agent(args.wandb_sweep_id, function=training, project="y3-deep-lss", count=1)
-            # the workers get the agent's hyperparameters via broadcast
             else:
                 training()
         else:

@@ -1,24 +1,21 @@
 # Copyright (C) 2023 ETH Zurich, Institute for Particle Physics and Astrophysics
+"""PyTorch ResNet-style DeepSphere layer builder."""
 
-"""
-Created November 2023
-Author: Arne Thomsen
-"""
+from __future__ import annotations
 
-import tensorflow as tf
-from deepsphere import healpy_layers
-
+from deep_lss.nets import deepsphere_torch as dst
 from deep_lss.nets.regression_head import get_regression_head
-from msfm.utils import logger
+import logging
 
-LOGGER = logger.get_logger(__file__)
+try:
+    from msfm.utils import logger
+except ImportError:
+    logger = None
+
+LOGGER = logger.get_logger(__file__) if logger is not None else logging.getLogger(__name__)
 
 
 class ResNetLayers:
-    """Class used to build the layers of the ResNet network, which was used as the fiducial architecture in Janis'
-    KiDS1000 analysis.
-    """
-
     def __init__(
         self,
         out_features,
@@ -31,75 +28,41 @@ class ResNetLayers:
         head_type="dense",
         dense_layers=None,
         dropout_rate=None,
-        # misc
         poly_degree=5,
-        norm_kwargs={},
-        activation=tf.nn.relu,
+        norm_kwargs=None,
+        activation="relu",
         smoothing_kwargs=None,
     ) -> None:
-        """Class used to build the layers of the ResNet network, which was used as the fiducial architecture in Janis'
-        KiDS1000 analysis.
-
-        Args:
-            out_features (int, optional): Output shape of the regression head. This determines the size of the learned
-                summary statistics. Defaults to 6.
-            n_base_channels (int, optional): Number of channels after the first layer of the network. This number gets
-                multiplied by a factor of two for every downsampling layer. Defaults to 32.
-            n_downsampling (int, optional): Number of pseudoconvolutions to perform a downsampling of the
-                neighboring Healpix pixels. Note that these layers are fairly cheap and their number effectively
-                determines how expensive the following (residual) graph convolutions are. Defaults to 3.
-            n_cheby (int, optional): Number of Chebyshev convolutions to downsample with. These layers play the
-                same role as the pure downsampling layers, just include an additional (Chebyshev) graph convoution.
-                Defaults to 2.
-            n_residuals (int, optional): Number of residual layers. These are the main graph convolutions. Defaults
-                to 6.
-            head_type (str, optional): Type of regression head to be used, allowed are "dense" and "conv. Defaults to
-                "dense".
-            dropout_rate (float, optional): Dropout rate within the regression head. Defaults to None, then it's not
-                included.
-            poly_degree (int, optional): Degree of the polynomials within the Chebyshev convolutions. Defaults to 5.
-            norm_kwargs (dict, optional): Keyword arguments to be passed to the normalization layers. Defaults to {}.
-            activation (callable, optional): Non-linear activation function to be used throughout. Defaults to
-                tf.nn.relu.
-            smoothing_kwargs (dict, optional): Keyword arguments to be passed to the smoothing layer. Defaults to None,
-                then no smoothing is performed within the network.
-        """
+        norm_kwargs = norm_kwargs or {}
         self.layers = []
 
         if smoothing_kwargs is not None:
-            self.layers.append(healpy_layers.HealpySmoothing(**smoothing_kwargs))
+            self.layers.append(dst.healpy_smoothing(**smoothing_kwargs))
         else:
             LOGGER.warning("No smoothing layer is included in the network")
 
-        # downsampling and increasing channels
-        n_channels = n_base_channels
-        for _ in range(n_downsampling):
-            self.layers.append(healpy_layers.HealpyPseudoConv(p=1, Fout=n_channels, activation=activation))
+        n_channels = base_channels
+        for _ in range(downsampling_layers):
+            self.layers.append(dst.healpy_pseudo_conv(p=1, Fout=n_channels, activation=activation))
             n_channels *= 2
 
-        # downsampling and Chebyshev convolutions
-        for _ in range(n_cheby):
-            self.layers.append(healpy_layers.HealpyChebyshev(K=poly_degree, Fout=n_channels, activation=activation))
-            self.layers.append(tf.keras.layers.LayerNormalization(**{"axis": -1, **norm_kwargs}))
-            self.layers.append(healpy_layers.HealpyPseudoConv(p=1, Fout=n_channels, activation=activation))
+        for _ in range(cheby_layers):
+            self.layers.append(dst.healpy_chebyshev(K=poly_degree, Fout=n_channels, activation=activation))
+            self.layers.append(dst.LazyLayerNorm(**norm_kwargs))
+            self.layers.append(dst.healpy_pseudo_conv(p=1, Fout=n_channels, activation=activation))
 
-        # residual Chebyshev convolutions
-        for _ in range(n_residuals):
+        for _ in range(residual_layers):
             self.layers.append(
-                healpy_layers.Healpy_ResidualLayer(
+                dst.healpy_residual(
                     "CHEBY",
                     layer_kwargs={"K": poly_degree, "activation": activation, "use_bias": True},
-                    # the delta loss is only compatible with layer and not batch normalization
                     use_bn=True,
                     bn_kwargs=norm_kwargs,
                     norm_type="layer_norm",
                 )
             )
 
-        # snapshot conv-only layers before the regression head is appended
         self._conv_layers = list(self.layers)
-
-        # regression head
         regression_head_layers = get_regression_head(
             out_features=out_features,
             head_type=head_type,
@@ -109,7 +72,6 @@ class ResNetLayers:
             poly_degree=poly_degree,
             norm_kwargs=norm_kwargs,
         )
-        # head without the leading Flatten — used when Cls are concatenated after flattening
         self._head_layers_no_flatten = regression_head_layers[1:] if head_type == "dense" else regression_head_layers
         self.layers.extend(regression_head_layers)
 
@@ -117,13 +79,7 @@ class ResNetLayers:
         return self.layers
 
     def get_conv_layers(self):
-        """Return only the graph-convolution layers, without the regression head."""
         return self._conv_layers
 
     def get_head_layers_no_flatten(self):
-        """Return the regression head layers without the leading Flatten layer.
-
-        Used by MapsPlusCLSNetwork which performs its own flatten-and-concat step before the head.
-        Only meaningful for head_type='dense'; for 'conv' heads the full head is returned.
-        """
         return self._head_layers_no_flatten
