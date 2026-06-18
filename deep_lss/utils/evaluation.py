@@ -95,13 +95,13 @@ def _remove_example_axis(array):
 
 
 def evaluate_grid(
-    model, tfr_pattern, msfm_conf, dlss_conf, net_conf, data_conf, dir_out, file_label=None, wandb_run=None, debug=False
+    model, record_pattern, msfm_conf, dlss_conf, net_conf, data_conf, dir_out, file_label=None, wandb_run=None, debug=False
 ):
     """Evaluate the model on the grid part of the CosmoGrid.
 
     Args:
         model (DeltaLossModel): Model to be evaluated.
-        tfr_pattern (str): Glob pattern of the .tfrecord files containing the data.
+        record_pattern (str): Glob pattern of the .tfrecord files containing the data.
         msfm_conf (dict): Configuration file of the msfm pipeline.
         net_conf (dict): Configuration file of the specific model.
         data_conf (dict): Train/test split config (signal_indices / noise_indices).
@@ -144,7 +144,7 @@ def evaluate_grid(
     # like https://www.tensorflow.org/tutorials/distribute/input#tfdistributestrategydistribute_datasets_from_function
     def dataset_fn(input_context):
         dset = grid_pipeline.get_dset(
-            tfr_pattern=tfr_pattern,
+            record_pattern=record_pattern,
             **dset_kwargs,
             # distribution
             input_context=input_context,
@@ -274,14 +274,14 @@ def evaluate_grid(
 
 
 def evaluate_fiducial(
-    model, tfr_pattern, msfm_conf, dlss_conf, net_conf, data_conf, dir_out, training_set=True, file_label=None, wandb_run=None
+    model, record_pattern, msfm_conf, dlss_conf, net_conf, data_conf, dir_out, training_set=True, file_label=None, wandb_run=None
 ):
     """Evaluate the model on the fiducial part of the CosmoGrid.
 
     Args:
         model (DeltaLossModel): Model to be evaluated.
         This is used to distribute the dataset.
-        tfr_pattern (str): Glob pattern of the .tfrecord files containing the data.
+        record_pattern (str): Glob pattern of the .tfrecord files containing the data.
         msfm_conf (dict): Configuration file of the msfm pipeline.
         net_conf (dict): Configuration file of the specific model.
         data_conf (dict): Train/test split config (signal_indices / noise_indices).
@@ -342,7 +342,7 @@ def evaluate_fiducial(
     # like https://www.tensorflow.org/tutorials/distribute/input#tfdistributestrategydistribute_datasets_from_function
     def dataset_fn(input_context):
         dset = fiducial_pipeline.get_dset(
-            tfr_pattern=tfr_pattern,
+            record_pattern=record_pattern,
             **dset_kwargs,
             # distribution
             input_context=input_context,

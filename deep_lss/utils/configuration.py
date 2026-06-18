@@ -121,8 +121,8 @@ def get_smoothing_kwargs(loss_function, msfm_conf, dlss_conf, net_conf, dir_base
     mask_dict = files.get_tomo_dv_masks(msfm_conf)
 
     # dlss
-    with_lensing = dlss_conf["dset"]["common"]["with_lensing"]
-    with_clustering = dlss_conf["dset"]["common"]["with_clustering"]
+    with_WL = dlss_conf["dset"]["common"]["with_WL"]
+    with_GC = dlss_conf["dset"]["common"]["with_GC"]
     with_cross = dlss_conf["dset"]["common"].get("with_cross", False)
 
     if with_cross:
@@ -131,14 +131,14 @@ def get_smoothing_kwargs(loss_function, msfm_conf, dlss_conf, net_conf, dir_base
         mask_metacal_total = np.prod(mask_dict["metacal"], axis=-1, keepdims=True)
         mask_maglim_total = np.prod(mask_dict["maglim"], axis=-1, keepdims=True)
         mask = mask_metacal_total * mask_maglim_total
-    elif with_lensing and with_clustering:
+    elif with_WL and with_GC:
         mask = np.concatenate([mask_dict["metacal"], mask_dict["maglim"]], axis=1)
-    elif with_lensing and not with_clustering:
+    elif with_WL and not with_GC:
         mask = mask_dict["metacal"]
-    elif not with_lensing and with_clustering:
+    elif not with_WL and with_GC:
         mask = mask_dict["maglim"]
     else:
-        raise ValueError("At least one of with_lensing, with_clustering, or with_cross must be True")
+        raise ValueError("At least one of with_WL, with_GC, or with_cross must be True")
 
     smooth_nside = net_conf["network"].get("smooth_nside", None)
     if smooth_nside is not None and smooth_nside < n_side:
@@ -162,11 +162,11 @@ def get_smoothing_kwargs(loss_function, msfm_conf, dlss_conf, net_conf, dir_base
         fwhm = []
         white_noise_sigma = []
         map_normalization = []
-        if with_lensing:
+        if with_WL:
             fwhm += dlss_conf["scale_cuts"]["lensing"]["theta_fwhm"]
             white_noise_sigma += dlss_conf["scale_cuts"]["lensing"]["white_noise_sigma"]
             map_normalization += msfm_conf["analysis"]["normalization"]["lensing"]
-        if with_clustering:
+        if with_GC:
             fwhm += dlss_conf["scale_cuts"]["clustering"]["theta_fwhm"]
             white_noise_sigma += dlss_conf["scale_cuts"]["clustering"]["white_noise_sigma"]
             map_normalization += msfm_conf["analysis"]["normalization"]["clustering"]
@@ -262,11 +262,11 @@ def get_cls_bounds_per_pair(msfm_conf, dlss_conf):
     from msfm.utils import cross_statistics
 
     dset_common = dlss_conf["dset"]["common"]
-    with_lensing = dset_common["with_lensing"]
-    with_clustering = dset_common["with_clustering"]
-    n_z_lensing = len(msfm_conf["survey"]["metacal"]["z_bins"]) if with_lensing else 0
-    n_z_clustering = len(msfm_conf["survey"]["maglim"]["z_bins"]) if with_clustering else 0
-    with_cross_probe = dset_common.get("with_cross_probe", with_lensing and with_clustering)
+    with_WL = dset_common["with_WL"]
+    with_GC = dset_common["with_GC"]
+    n_z_lensing = len(msfm_conf["survey"]["metacal"]["z_bins"]) if with_WL else 0
+    n_z_clustering = len(msfm_conf["survey"]["maglim"]["z_bins"]) if with_GC else 0
+    with_cross_probe = dset_common.get("with_cross_probe", with_WL and with_GC)
     ggl_only = dset_common.get("ggl_only", False)
 
     _DEFAULT_L_MIN = 30
@@ -276,14 +276,14 @@ def get_cls_bounds_per_pair(msfm_conf, dlss_conf):
     l_min_clustering = list(scale_cuts.get("clustering", {}).get("l_min", [_DEFAULT_L_MIN] * n_z_clustering))
     l_max_lensing = list(scale_cuts.get("lensing", {}).get("l_max", [None] * n_z_lensing))
     l_max_clustering = list(scale_cuts.get("clustering", {}).get("l_max", [None] * n_z_clustering))
-    l_min_per_z = (l_min_lensing if with_lensing else []) + (l_min_clustering if with_clustering else [])
-    l_max_per_z = (l_max_lensing if with_lensing else []) + (l_max_clustering if with_clustering else [])
+    l_min_per_z = (l_min_lensing if with_WL else []) + (l_min_clustering if with_GC else [])
+    l_max_per_z = (l_max_lensing if with_WL else []) + (l_max_clustering if with_GC else [])
 
     _, names = cross_statistics.get_cross_bin_indices(
         n_z_lensing,
         n_z_clustering,
-        with_lensing=with_lensing,
-        with_clustering=with_clustering,
+        with_WL=with_WL,
+        with_GC=with_GC,
         with_cross_z=dset_common.get("with_cross_z", True),
         with_cross_probe=with_cross_probe,
         ggl_only=ggl_only,
