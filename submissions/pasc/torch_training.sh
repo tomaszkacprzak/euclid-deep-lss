@@ -8,10 +8,10 @@
 #SBATCH --gpus-per-node=4
 #SBATCH --gpus-per-task=4
 #SBATCH --cpus-per-task=128
-#SBATCH --job-name=tf_training
+#SBATCH --job-name=torch_training
 #SBATCH --output="./logs/training_%j.log"
 
-STRATEGY="mirrored"
+STRATEGY="ddp"
 VERSION="v7"
 # lensing, clustering, combined
 PROBE="combined"
@@ -31,7 +31,7 @@ else
 fi
 
 srun --cpu-bind=threads --gpu-bind=none --output="$OUTPUT" \
-    python ../../deep_lss/apps/run_training.py \
+    torchrun --standalone --nproc_per_node="$SLURM_GPUS_ON_NODE" ../../deep_lss/apps/run_training.py \
     --loss_function="$LOSS" \
     --dist_strategy="$STRATEGY" \
     --train_tfr_pattern="/pscratch/sd/a/athomsen/DESY3/$VERSION/$BIAS/tfrecords/$TRAINSET/DESy3_${TRAINSET}_????.tfrecord" \
@@ -39,7 +39,7 @@ srun --cpu-bind=threads --gpu-bind=none --output="$OUTPUT" \
     --grid_vali_tfr_pattern="/pscratch/sd/a/athomsen/DESY3/$VERSION/$BIAS/tfrecords/grid/DESy3_grid_????.tfrecord" \
     --dir_base="/pscratch/sd/a/athomsen/run_files/$VERSION/$PROBE/$LOSS" \
     --dlss_config="configs/$VERSION/pasc/$PROBE/dlss_config.yaml" \
-    --net_config="configs/$VERSION/pasc/resnet_tf.yaml" \
+    --net_config="configs/$VERSION/pasc/resnet_torch.yaml" \
     --msfm_config="/global/homes/a/athomsen/multiprobe-simulation-forward-model/configs/$VERSION/$BIAS.yaml" \
     --slurm_output="$OUTPUT" \
     --wandb \

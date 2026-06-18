@@ -10,7 +10,6 @@
 
 export SLURM_CPUS_PER_TASK=72
 export OMP_NUM_THREADS=${SLURM_CPUS_PER_TASK}
-export TF_NUM_INTRAOP_THREADS=${SLURM_CPUS_PER_TASK}
 
 REPOS="/users/athomsen/dlss/repos"
 MYSCRATCH="/iopsstor/scratch/cscs/athomsen"
@@ -31,7 +30,7 @@ for PROBE in "${PROBES[@]}"; do
     mkdir -p "$(dirname "$LOG")"
 
     srun -N1 --ntasks-per-node=1 --exclusive --gpus-per-task=1 --cpus-per-gpu=72 --mem=110G \
-        --environment=tensorflow \
+        --uenv=pytorch/v2.9.1:v2 --view=default \
         --output="${LOG}_training.log" \
         python "$REPOS/y3-deep-lss/deep_lss/apps/run_cls_training+evaluation.py" \
             --msfm_config="$REPOS/multiprobe-simulation-forward-model/configs/$VERSION/$SUBVERSION.yaml" \
