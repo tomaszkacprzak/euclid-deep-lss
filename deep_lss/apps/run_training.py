@@ -108,7 +108,7 @@ def setup():
     parser.add_argument("--loss_function",
         type=str,
         default=None,
-        choices=["delta", "mse", "likelihood", "mutual_info", "onthefly_mutual_info"],
+        choices=["delta", "mse", "likelihood", "mutual_info"],
         help="loss function to train with. If omitted, read from loss_function key in the loss config.",
     )
     parser.add_argument("--dist_strategy",
@@ -342,7 +342,7 @@ def training():
     # initialize a fresh model
     if not args.restore_checkpoint:
         # load the configs
-        net_conf = input_output.read_yaml(os.path.join(args.repo_dir, args.net_config))
+        net_conf = input_output.read_yaml(args.net_config)
         dlss_conf = configuration.read_split_configs(args.probes_config, args.scales_config)
         loss_conf = input_output.read_yaml(args.loss_config)
         data_conf = input_output.read_yaml(args.data_config)
@@ -520,8 +520,8 @@ def training():
     n_params = len(params)
     LOGGER.info(f"Training with respect to the {n_params} parameters {params}")
 
-    with_lensing = dlss_conf["dset"]["common"]["with_lensing"]
-    with_clustering = dlss_conf["dset"]["common"]["with_clustering"]
+    with_WL = dlss_conf["dset"]["common"]["with_WL"]
+    with_GC = dlss_conf["dset"]["common"]["with_GC"]
     with_cross = dlss_conf["dset"]["common"].get("with_cross", False)
     return_cls = "cls_n_bins" in net_conf["network"]
     if return_cls:
@@ -582,15 +582,6 @@ def training():
         local_batch_size = dset_kwargs["local_batch_size"]
         effective_local_batch_size = local_batch_size
 
-    elif args.loss_function == "onthefly_mutual_info":
-        
-        n_output = loss_conf["mutual_info_loss"]["dim_summary_fac"] * n_params
-        from msfm.onthefly_physics.onthefly_linear import OntheflyPhysicsModelLinear
-        Pipeline = OntheflyPhysicsModelLinear
-        Model = GridLossModel
-        dset_kwargs.update(net_conf["dset"]["training"]["grid"])
-        local_batch_size = dset_kwargs["local_batch_size"]
-        effective_local_batch_size = local_batch_size
         
 
     # constants: redshift bins
@@ -598,9 +589,9 @@ def training():
         n_z_bins = len(dset_kwargs["z_bin_inds"])
     except (KeyError, TypeError):
         n_z_bins = 0
-        if with_lensing:
+        if with_WL:
             n_z_bins += len(msfm_conf["survey"]["WL"]["z_bins"])
-        if with_clustering:
+        if with_GC:
             n_z_bins += len(msfm_conf["survey"]["GC"]["z_bins"])
         if with_cross:
             n_z_bins += len(msfm_conf["survey"]["WL"]["z_bins"]) * len(msfm_conf["survey"]["GC"]["z_bins"])
@@ -639,6 +630,7 @@ def training():
         LOGGER.info(f"Network kwargs including regularization: {net_conf['network']['kwargs']}")
 
         optimizer = optimization.get_optimizer(net_conf, args.loss_function, args.restore_checkpoint)
+        print(f"Optimizer: {optimizer}")
 
         if return_cls:
             # Build a MapsPlusCLSNetwork: HealpyGCNN for maps + binned log-Cls concatenated.

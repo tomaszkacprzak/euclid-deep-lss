@@ -121,24 +121,24 @@ def get_smoothing_kwargs(loss_function, msfm_conf, dlss_conf, net_conf, dir_base
     mask_dict = files.get_tomo_dv_masks(msfm_conf)
 
     # dlss
-    with_lensing = dlss_conf["dset"]["common"]["with_lensing"]
-    with_clustering = dlss_conf["dset"]["common"]["with_clustering"]
+    with_WL = dlss_conf["dset"]["common"]["with_WL"]
+    with_GC = dlss_conf["dset"]["common"]["with_GC"]
     with_cross = dlss_conf["dset"]["common"].get("with_cross", False)
 
     if with_cross:
         # mirrors the per-pixel mask used in msfm.grid_pipeline._augmentations for the cross maps:
         # AND of the two probe masks, broadcast across all n_z_cross channels.
-        mask_metacal_total = np.prod(mask_dict["metacal"], axis=-1, keepdims=True)
-        mask_maglim_total = np.prod(mask_dict["maglim"], axis=-1, keepdims=True)
-        mask = mask_metacal_total * mask_maglim_total
-    elif with_lensing and with_clustering:
-        mask = np.concatenate([mask_dict["metacal"], mask_dict["maglim"]], axis=1)
-    elif with_lensing and not with_clustering:
-        mask = mask_dict["metacal"]
-    elif not with_lensing and with_clustering:
-        mask = mask_dict["maglim"]
+        mask_WL_total = np.prod(mask_dict["WL"], axis=-1, keepdims=True)
+        mask_GC_total = np.prod(mask_dict["GC"], axis=-1, keepdims=True)
+        mask = mask_WL_total * mask_GC_total
+    elif with_WL and with_GC:
+        mask = np.concatenate([mask_dict["WL"], mask_dict["GC"]], axis=1)
+    elif with_WL and not with_GC:
+        mask = mask_dict["WL"]
+    elif not with_WL and with_GC:
+        mask = mask_dict["GC"]
     else:
-        raise ValueError("At least one of with_lensing, with_clustering, or with_cross must be True")
+        raise ValueError("At least one of with_WL, with_GC, or with_cross must be True")
 
     smooth_nside = net_conf["network"].get("smooth_nside", None)
     if smooth_nside is not None and smooth_nside < n_side:
@@ -162,24 +162,24 @@ def get_smoothing_kwargs(loss_function, msfm_conf, dlss_conf, net_conf, dir_base
         fwhm = []
         white_noise_sigma = []
         map_normalization = []
-        if with_lensing:
-            fwhm += dlss_conf["scale_cuts"]["lensing"]["theta_fwhm"]
-            white_noise_sigma += dlss_conf["scale_cuts"]["lensing"]["white_noise_sigma"]
-            map_normalization += msfm_conf["analysis"]["normalization"]["lensing"]
-        if with_clustering:
-            fwhm += dlss_conf["scale_cuts"]["clustering"]["theta_fwhm"]
-            white_noise_sigma += dlss_conf["scale_cuts"]["clustering"]["white_noise_sigma"]
-            map_normalization += msfm_conf["analysis"]["normalization"]["clustering"]
+        if with_WL:
+            fwhm += dlss_conf["scale_cuts"]["WL"]["theta_fwhm"]
+            white_noise_sigma += dlss_conf["scale_cuts"]["WL"]["white_noise_sigma"]
+            map_normalization += msfm_conf["analysis"]["normalization"]["WL"]
+        if with_GC:
+            fwhm += dlss_conf["scale_cuts"]["GC"]["theta_fwhm"]
+            white_noise_sigma += dlss_conf["scale_cuts"]["GC"]["white_noise_sigma"]
+            map_normalization += msfm_conf["analysis"]["normalization"]["GC"]
         if with_cross:
-            # The 16 (n_z_metacal x n_z_maglim) cross bins are always derived from the lensing and clustering blocks
+            # The 16 (n_z_WL x n_z_GC) cross bins are always derived from the lensing and clustering blocks
             # above. alm_cross = sqrt(alm_k * alm_d) → effective Gaussian beam sigma_b^2 averages, and for independent
             # zero-mean complex Gaussian white noise the cross alm has <|alm_cross|^2> = (pi/4) * sigma_k * sigma_d *
             # Omega_pix (still flat in l).
-            fwhm_k = np.asarray(dlss_conf["scale_cuts"]["lensing"]["theta_fwhm"], dtype=float)
-            fwhm_d = np.asarray(dlss_conf["scale_cuts"]["clustering"]["theta_fwhm"], dtype=float)
-            sig_k = np.asarray(dlss_conf["scale_cuts"]["lensing"]["white_noise_sigma"], dtype=float)
-            sig_d = np.asarray(dlss_conf["scale_cuts"]["clustering"]["white_noise_sigma"], dtype=float)
-            # outer-product over (i_metacal, j_maglim), flattened in (i * n_z_maglim + j) order
+            fwhm_k = np.asarray(dlss_conf["scale_cuts"]["WL"]["theta_fwhm"], dtype=float)
+            fwhm_d = np.asarray(dlss_conf["scale_cuts"]["GC"]["theta_fwhm"], dtype=float)
+            sig_k = np.asarray(dlss_conf["scale_cuts"]["WL"]["white_noise_sigma"], dtype=float)
+            sig_d = np.asarray(dlss_conf["scale_cuts"]["GC"]["white_noise_sigma"], dtype=float)
+            # outer-product over (i_WL, j_GC), flattened in (i * n_z_GC + j) order
             # to match the cross-map ordering in msfm.apps.run_grid_postprocessing
             fwhm_cross = np.sqrt((fwhm_k[:, None] ** 2 + fwhm_d[None, :] ** 2) / 2.0).ravel()
             sigma_cross = np.sqrt(np.pi / 4.0) * np.sqrt(sig_k[:, None] * sig_d[None, :]).ravel()
@@ -262,28 +262,28 @@ def get_cls_bounds_per_pair(msfm_conf, dlss_conf):
     from msfm.utils import cross_statistics
 
     dset_common = dlss_conf["dset"]["common"]
-    with_lensing = dset_common["with_lensing"]
-    with_clustering = dset_common["with_clustering"]
-    n_z_lensing = len(msfm_conf["survey"]["metacal"]["z_bins"]) if with_lensing else 0
-    n_z_clustering = len(msfm_conf["survey"]["maglim"]["z_bins"]) if with_clustering else 0
-    with_cross_probe = dset_common.get("with_cross_probe", with_lensing and with_clustering)
+    with_WL = dset_common["with_WL"]
+    with_GC = dset_common["with_GC"]
+    n_z_lensing = len(msfm_conf["survey"]["WL"]["z_bins"]) if with_WL else 0
+    n_z_clustering = len(msfm_conf["survey"]["GC"]["z_bins"]) if with_GC else 0
+    with_cross_probe = dset_common.get("with_cross_probe", with_WL and with_GC)
     ggl_only = dset_common.get("ggl_only", False)
 
     _DEFAULT_L_MIN = 30
 
     scale_cuts = dlss_conf.get("scale_cuts", {})
-    l_min_lensing = list(scale_cuts.get("lensing", {}).get("l_min", [_DEFAULT_L_MIN] * n_z_lensing))
-    l_min_clustering = list(scale_cuts.get("clustering", {}).get("l_min", [_DEFAULT_L_MIN] * n_z_clustering))
-    l_max_lensing = list(scale_cuts.get("lensing", {}).get("l_max", [None] * n_z_lensing))
-    l_max_clustering = list(scale_cuts.get("clustering", {}).get("l_max", [None] * n_z_clustering))
-    l_min_per_z = (l_min_lensing if with_lensing else []) + (l_min_clustering if with_clustering else [])
-    l_max_per_z = (l_max_lensing if with_lensing else []) + (l_max_clustering if with_clustering else [])
+    l_min_lensing = list(scale_cuts.get("WL", {}).get("l_min", [_DEFAULT_L_MIN] * n_z_lensing))
+    l_min_clustering = list(scale_cuts.get("GC", {}).get("l_min", [_DEFAULT_L_MIN] * n_z_clustering))
+    l_max_lensing = list(scale_cuts.get("WL", {}).get("l_max", [None] * n_z_lensing))
+    l_max_clustering = list(scale_cuts.get("GC", {}).get("l_max", [None] * n_z_clustering))
+    l_min_per_z = (l_min_lensing if with_WL else []) + (l_min_clustering if with_GC else [])
+    l_max_per_z = (l_max_lensing if with_WL else []) + (l_max_clustering if with_GC else [])
 
     _, names = cross_statistics.get_cross_bin_indices(
         n_z_lensing,
         n_z_clustering,
-        with_lensing=with_lensing,
-        with_clustering=with_clustering,
+        with_WL=with_WL,
+        with_GC=with_GC,
         with_cross_z=dset_common.get("with_cross_z", True),
         with_cross_probe=with_cross_probe,
         ggl_only=ggl_only,

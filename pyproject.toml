@@ -36,7 +36,7 @@ dependencies = [
     "icecream",
     "pandas>=2.2.3",
     "torch",
-    "deepsphere-cosmo-pytorch @ git+https://github.com/tomaszkacprzak/deepsphere-cosmo-pytorch.git",
+    "deepsphere @ git+https://github.com/tomaszkacprzak/deepsphere-cosmo-pytorch.git",
 ]
 
 [project.optional-dependencies]
