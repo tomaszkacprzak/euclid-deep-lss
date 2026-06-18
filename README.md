@@ -10,7 +10,7 @@ This repository contains the pipeline to train neural networks that learn inform
 
 ## Installation
 
-Requires Python >= 3.8, TensorFlow >= 2.0, TensorFlow-Probability, and Horovod.
+Requires Python >= 3.8 and PyTorch. Distributed training uses native `torch.distributed`/DDP launched with `torchrun` or Slurm.
 
 **Main dependencies:**
 - [`euclid-multiprobe-simulation-forward-model`](https://github.com/tomaszkacprzak/euclid-multiprobe-simulation-forward-model/) for data loading and utilities
@@ -27,17 +27,11 @@ pip install git+https://github.com/deepsphere/deepsphere-pytorch.git
 
 **Step 2: Install this package**
 
-*On HPC clusters with pre-installed TensorFlow/Horovod* (recommended):
 ```bash
 pip install -e .
 ```
 
-*On systems without TensorFlow/Horovod*:
-```bash
-pip install -e .[tf]
-```
-
-Use the first option when TensorFlow and Horovod are available via system modules (e.g., `module load tensorflow horovod`) to preserve optimized GPU/MPI configurations.
+On HPC clusters, load or activate a PyTorch environment provided by the site before installing this package. Use `python ...` for single-process runs and `torchrun ...` (optionally inside `srun`) for multi-GPU or multi-node DDP jobs.
 
 ## Repository Structure
 

@@ -11,7 +11,7 @@
 #SBATCH --output=/users/athomsen/dlss/repos/y3-deep-lss/submissions/clariden/slurm/slurm-%j.out
 
 REPOS="/users/athomsen/dlss/repos"
-STRATEGY="mirrored"
+STRATEGY="ddp"
 LOSS="vmim"
 SCALES="8wl,32gc"
 FLOW_CONFIG="$REPOS/multiprobe-simulation-inference/configs/flow/default.yaml"
@@ -40,10 +40,9 @@ GRID_EVAL_TFR=$TRAIN_TFR
 export WANDB_API_KEY=$(awk '/password/ {print $2}' ~/.netrc)
 
 export OMP_NUM_THREADS=${SLURM_CPUS_PER_TASK}
-export TF_NUM_INTRAOP_THREADS=${SLURM_CPUS_PER_TASK}
 
-srun --environment=tensorflow --gpu-bind=none --output=""$LOG"_training.log" \
-    python $REPOS/y3-deep-lss/deep_lss/apps/run_training.py \
+srun --uenv=pytorch/v2.9.1:v2 --view=default --gpu-bind=none --output=""$LOG"_training.log" \
+    torchrun --standalone --nproc_per_node="$SLURM_GPUS_ON_NODE" $REPOS/y3-deep-lss/deep_lss/apps/run_training.py \
         --dir_base=$OUTPUT \
         --dir_model=$MODEL \
         --train_tfr_pattern=$TRAIN_TFR \
@@ -60,8 +59,8 @@ srun --environment=tensorflow --gpu-bind=none --output=""$LOG"_training.log" \
 
 sleep 30
 
-srun --environment=tensorflow --gpu-bind=none --output=""$LOG"_inference.log" \
-    python $REPOS/y3-deep-lss/deep_lss/apps/run_evaluation.py \
+srun --uenv=pytorch/v2.9.1:v2 --view=default --gpu-bind=none --output=""$LOG"_inference.log" \
+    torchrun --standalone --nproc_per_node="$SLURM_GPUS_ON_NODE" $REPOS/y3-deep-lss/deep_lss/apps/run_evaluation.py \
         --dist_strategy="$STRATEGY" \
         --grid_vali_tfr_pattern=$GRID_EVAL_TFR \
         --data_dir=$INPUT \
