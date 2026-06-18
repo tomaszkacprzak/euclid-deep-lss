@@ -40,8 +40,8 @@ warnings.filterwarnings("ignore", category=DeprecationWarning)
 warnings.filterwarnings("ignore", category=RuntimeWarning)
 warnings.filterwarnings("once", category=UserWarning)
 
-import tensorflow as tf
-import torch
+from deep_lss.data.tfrecords import tf
+import horovod.tensorflow as hvd
 import argparse, yaml, wandb, shutil
 
 from datetime import datetime

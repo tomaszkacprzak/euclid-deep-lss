@@ -13,7 +13,9 @@ import os
 
 import h5py
 import numpy as np
-import tensorflow as tf
+import torch
+
+from deep_lss.data.tfrecords import make_tensor_dataloader
 
 from msfm.utils import logger
 
@@ -66,7 +68,9 @@ def _build_bin_weights_all_pairs(n_ell, n_bins, n_z_lensing, n_z_clustering, l_m
 
     # Log summary table.
     type_w = max(len(f"{r[3]}×{r[4]}") for r in rows)
-    header = f"  {'pair':>4}  {'zi':>2}  {'zj':>2}  {'type':<{type_w}}  {'l_min':>5}  {'l_max':>5}  {'n_ells':>6}  ells/bin"
+    header = (
+        f"  {'pair':>4}  {'zi':>2}  {'zj':>2}  {'type':<{type_w}}  {'l_min':>5}  {'l_max':>5}  {'n_ells':>6}  ells/bin"
+    )
     LOGGER.info(f"Bin weights (n_bins={n_bins}, n_ell={n_ell}, n_pairs={n_total_pairs}):")
     LOGGER.info(header)
     empty_bins = []
@@ -74,11 +78,15 @@ def _build_bin_weights_all_pairs(n_ell, n_bins, n_z_lensing, n_z_clustering, l_m
         epb_str = "[" + " ".join(f"{v:2d}" for v in epb) + "]"
         n_empty = epb.count(0)
         flag = "  *** empty bins" if n_empty > 0 else ""
-        LOGGER.info(f"  {k:4d}  {i:2d}  {j:2d}  {pi}×{pj:<{type_w - len(pi) - 1}}  {lmin_p:5.0f}  {lmax_p:5.0f}  {n_used:6d}  {epb_str}{flag}")
+        LOGGER.info(
+            f"  {k:4d}  {i:2d}  {j:2d}  {pi}×{pj:<{type_w - len(pi) - 1}}  {lmin_p:5.0f}  {lmax_p:5.0f}  {n_used:6d}  {epb_str}{flag}"
+        )
         if n_empty > 0:
             empty_bins.append((k, i, j, n_empty))
     if empty_bins:
-        LOGGER.warning(f"{len(empty_bins)} pairs have empty bins — check l_min/l_max config: {[(k,i,j) for k,i,j,_ in empty_bins]}")
+        LOGGER.warning(
+            f"{len(empty_bins)} pairs have empty bins — check l_min/l_max config: {[(k,i,j) for k,i,j,_ in empty_bins]}"
+        )
     return W
 
 
@@ -202,7 +210,7 @@ def get_rebinned_cls_dsets(
     batch_size=1024,
     shuffle_buffer="full",
     prefetch=3,
-    num_parallel_calls=tf.data.AUTOTUNE,
+    num_parallel_calls=None,
     float_type=np.float32,
 ):
     """Load rebinned Cls from cache (building it if needed) and return TF datasets.
@@ -270,7 +278,7 @@ def get_rebinned_cls_dsets(
         return_fiducial=False,
         return_grid=True,
     )
-    grid_cosmos = meta_dict["grid/cosmo"]   # (n_cosmos, n_examples, n_params_all)
+    grid_cosmos = meta_dict["grid/cosmo"]  # (n_cosmos, n_examples, n_params_all)
     grid_i_sobols = meta_dict["grid/i_sobol"]  # (n_cosmos, n_examples)
     grid_i_signals = meta_dict["grid/i_signal"]
     grid_i_noises = meta_dict["grid/i_noise"]
@@ -278,6 +286,7 @@ def get_rebinned_cls_dsets(
     # Filter cosmo to the requested training params.
     if params is not None:
         from msfm.utils import parameters as msfm_params
+
         all_params = msfm_params.get_parameters(None, msfm_conf)
         requested = msfm_params.get_parameters(params, msfm_conf)
         param_indices = [i for i, p in enumerate(all_params) if p in requested]
@@ -329,36 +338,34 @@ def get_rebinned_cls_dsets(
 
     LOGGER.info(f"Train: {grid_cls_train.shape[0]} examples, Test: {grid_cls_test.shape[0]} examples")
 
-    # Build TF datasets. Sign-log is applied as an augmentation (not baked into cache),
+    # Build PyTorch datasets/loaders. Sign-log is applied as an augmentation (not baked into cache),
     # matching the pattern of the existing hard-cut pipeline.
-    if shuffle_buffer == "full":
-        shuffle_buffer = grid_cls_train.shape[0]
-
-    def _sign_log(signal, label):
-        signal = tf.math.sign(signal) * tf.math.log(tf.abs(signal) + 1e-10)
-        return signal, label
-
-    dset_train = (
-        tf.data.Dataset.from_tensor_slices((grid_cls_train, grid_cosmos_train))
-        .cache()
-        .shuffle(shuffle_buffer)
-        .repeat()
-        .batch(batch_size)
-        .map(_sign_log, num_parallel_calls=num_parallel_calls, deterministic=False)
-        .prefetch(prefetch)
-    )
-
-    dset_test = (
-        tf.data.Dataset.from_tensor_slices((grid_cls_test, grid_cosmos_test))
-        .cache()
-        .batch(batch_size)
-        .map(_sign_log, num_parallel_calls=num_parallel_calls, deterministic=True)
-        .prefetch(prefetch)
-    )
+    if shuffle_buffer not in ("full", None, grid_cls_train.shape[0]):
+        LOGGER.warning(f"PyTorch DataLoader uses full-dataset shuffling; ignoring shuffle_buffer={shuffle_buffer}")
 
     # Apply sign-log to the static eval arrays and obs Cls.
     def _np_sign_log(x):
         return np.sign(x) * np.log(np.abs(x) + 1e-10)
+
+    def _collate_sign_log(batch):
+        cls, cosmo = torch.utils.data.default_collate(batch)
+        cls = torch.sign(cls) * torch.log(torch.abs(cls) + 1e-10)
+        return cls, cosmo
+
+    dset_train = make_tensor_dataloader(
+        grid_cls_train,
+        grid_cosmos_train,
+        batch_size=batch_size,
+        shuffle=True,
+        collate_fn=_collate_sign_log,
+    )
+    dset_test = make_tensor_dataloader(
+        grid_cls_test,
+        grid_cosmos_test,
+        batch_size=batch_size,
+        shuffle=False,
+        collate_fn=_collate_sign_log,
+    )
 
     out_dict = {
         "grid/cls_raw/train": grid_cls_train.copy(),
@@ -421,6 +428,7 @@ def preprocess_obs_hard_rebinned(
 
     if obs_cl is None:
         from msfm.utils import observation
+
         _, obs_cl, _ = observation.forward_model_observation_map(
             wl_gamma_map=wl_gamma_map,
             gc_count_map=gc_count_map,
