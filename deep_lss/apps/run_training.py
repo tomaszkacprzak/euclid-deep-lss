@@ -71,73 +71,61 @@ def setup():
     description = "Train the specified network at the fiducial cosmology."
     parser = argparse.ArgumentParser(description=description, add_help=True)
 
-    parser.add_argument(
-        "-v",
-        "--verbosity",
+    parser.add_argument("-v", "--verbosity",
         type=str,
         default="info",
         choices=("critical", "error", "warning", "info", "debug"),
         help="logging level",
     )
-    parser.add_argument(
-        "--loss_function",
+    parser.add_argument("--loss_function",
         type=str,
         default=None,
         choices=["delta", "mse", "likelihood", "mutual_info"],
         help="loss function to train with. If omitted, read from loss_function key in the loss config.",
     )
-    parser.add_argument(
-        "--dist_strategy",
+    parser.add_argument("--dist_strategy",
         choices=[None, "mirrored", "multi_worker_mirrored", "horovod"],
         default=None,
         help="distribution strategy, use None to run locally",
     )
-    parser.add_argument(
-        "--train_tfr_pattern",
+    parser.add_argument("--train_file_pattern",
         type=str,
         required=True,
         help="input root dir of the fiducial or grid data vectors (training)",
     )
-    parser.add_argument(
-        "--fidu_vali_tfr_pattern",
+    parser.add_argument("--fidu_vali_file_pattern",
         type=str,
         default=None,
         help="input root dir of the fiducial data vectors (validation)",
     )
-    parser.add_argument(
-        "--grid_vali_tfr_pattern",
+    parser.add_argument("--grid_vali_file_pattern",
         type=str,
         default=None,
         help="input root dir of the grid data vectors (validation)",
     )
-    parser.add_argument(
-        "--fidu_eval_tfr_pattern",
+    parser.add_argument("--fidu_eval_file_pattern",
         type=str,
         default=None,
         help="input root dir of the fiducial data vectors (evaluation)",
     )
-    parser.add_argument(
-        "--grid_eval_tfr_pattern",
+    parser.add_argument("--grid_eval_file_pattern",
         type=str,
         default=None,
         help="input root dir of the grid data vectors (evaluation)",
     )
-    parser.add_argument(
-        "--dir_base",
+    parser.add_argument("--dir_base",
         type=str,
         default=None,
         help="base dir where the models are saved. If None, a dir within the repo is generated according to the config",
     )
-    parser.add_argument(
-        "--dir_model",
+    parser.add_argument("--dir_model",
         type=str,
         default=None,
         help="dir where the model summaries and checkpoints are saved. If None, a dir is generated according to the"
         " current date and time. This dir is appended to the dir_base as a relative path. Passing an absolute path"
         " overrides this.",
     )
-    parser.add_argument(
-        "--net_config",
+    parser.add_argument("--net_config",
         type=str,
         default="config/resnet_vanilla.yaml",
         help=(
@@ -145,12 +133,27 @@ def setup():
             " the dir_model and restore_checkpoint is true."
         ),
     )
-    parser.add_argument("--probes_config", type=str, default=None, help="probe/parameter config (configs/probes/)")
-    parser.add_argument("--scales_config", type=str, default=None, help="scale-cut config (configs/scales/)")
-    parser.add_argument("--loss_config", type=str, default=None, help="loss function config (configs/loss/)")
-    parser.add_argument("--data_config", type=str, default=None, help="train/test split config (configs/data/)")
-    parser.add_argument(
-        "--msfm_config",
+    parser.add_argument("--probes_config", 
+        type=str, 
+        default=None, 
+        help="probe/parameter config (configs/probes/)"
+    )
+    parser.add_argument("--scales_config", 
+        type=str, 
+        default=None, 
+        help="scale-cut config (configs/scales/)"
+    )
+    parser.add_argument("--loss_config", 
+        type=str, 
+        default=None, 
+        help="loss function config (configs/loss/)"
+    )
+    parser.add_argument("--data_config", 
+        type=str, 
+        default=None, 
+        help="train/test split config (configs/data/)"
+    )
+    parser.add_argument("--msfm_config",
         type=str,
         default=None,
         help=(
@@ -158,41 +161,71 @@ def setup():
             " standard configuration file in configs/config.yaml relative to the msfm repo is loaded."
         ),
     )
-    parser.add_argument(
-        "--restore_checkpoint",
+    parser.add_argument("--restore_checkpoint",
         action="store_true",
         help=(
             "restore the model from a checkpoint instead of initializing it from scratch."
             " Additionally, the configs are loaded from the path in this case"
         ),
     )
-    parser.add_argument("--evaluate_training_set", action="store_true", help="evaluate the training set")
-    parser.add_argument("--slurm_output", type=str, default=None, help="path to the slurm output file")
-
-    parser.add_argument("--debug", action="store_true", help="activate debug mode")
-    parser.add_argument("--profile", action="store_true", help="run the profiler")
-    parser.add_argument("--mixed_precision", action="store_true", help="use mixed precision training")
-    parser.add_argument(
-        "--mixed_precision_dtype",
+    parser.add_argument("--evaluate_training_set", 
+        action="store_true", 
+        help="evaluate the training set"
+    )
+    parser.add_argument("--slurm_output", 
+        type=str, 
+        default=None, 
+        help="path to the slurm output file"
+    )
+    parser.add_argument("--debug", 
+        action="store_true", 
+        help="activate debug mode"
+    )
+    parser.add_argument("--profile", 
+        action="store_true", 
+        help="run the profiler"
+    )
+    parser.add_argument("--mixed_precision", 
+        action="store_true", 
+        help="use mixed precision training"
+    )
+    parser.add_argument("--mixed_precision_dtype",
         type=str,
         default="float16",
         choices=("float16", "bfloat16"),
         help="mixed precision dtype to use when --mixed_precision is enabled",
     )
-    parser.add_argument("--xla", action="store_true", help="enable XLA (Accelerated Linear Algebra) JIT compilation")
-    parser.add_argument(
-        "--summary_every",
+    parser.add_argument("--xla", 
+        action="store_true", 
+        help="enable XLA (Accelerated Linear Algebra) JIT compilation"
+    )
+    parser.add_argument("--summary_every",
         type=int,
         default=1,
         help="log step_time and global_step summaries every N training steps (set to 1 to keep previous behavior)",
     )
-
-    parser.add_argument("--wandb", action="store_true", help="log to weights & biases, otherwise log to tensorboard")
-    parser.add_argument("--wandb_tags", nargs="+", type=str, default=None, help="tags for weights & biases")
-    parser.add_argument("--wandb_notes", type=str, default=None, help="notes for weights & biases (longer than tags)")
-    parser.add_argument("--wandb_sweep_id", type=str, default=None, help="id of the sweep. If None, no sweep is used")
-
-    parser.add_argument("--pasc_throughput", action="store_true")
+    parser.add_argument("--wandb", 
+        action="store_true", 
+        help="log to weights & biases, otherwise log to tensorboard"
+    )
+    parser.add_argument("--wandb_tags", 
+        nargs="+", 
+        type=str, 
+        default=None, 
+        help="tags for weights & biases"
+    )
+    parser.add_argument("--wandb_notes", 
+        type=str, 
+        default=None, 
+        help="notes for weights & biases (longer than tags)"
+    )
+    parser.add_argument("--wandb_sweep_id", 
+        type=str, 
+        default=None, 
+        help="id of the sweep. If None, no sweep is used"
+    )
+    parser.add_argument("--pasc_throughput", 
+        action="store_true")
 
     args, _ = parser.parse_known_args()
 
@@ -200,7 +233,7 @@ def setup():
         raise ValueError(f"summary_every must be >= 1, got {args.summary_every}")
 
     assert not (
-        (args.fidu_vali_tfr_pattern is not None) and (args.grid_vali_tfr_pattern is not None)
+        (args.fidu_vali_file_pattern is not None) and (args.grid_vali_file_pattern is not None)
     ), "Only one of the validation sets can be provided"
 
     # set up directories
@@ -477,9 +510,9 @@ def training():
 
     # constants: miscellaneous
     if args.loss_function == "delta":
-        assert "fiducial" in args.train_tfr_pattern, "The delta loss can only be used for the fiducial dataset"
+        assert "fiducial" in args.train_file_pattern, "The delta loss can only be used for the fiducial dataset"
     else:
-        assert "grid" in args.train_tfr_pattern, f"The {args.loss_function} loss can only be used for the grid dataset"
+        assert "grid" in args.train_file_pattern, f"The {args.loss_function} loss can only be used for the grid dataset"
     training_type = "fiducial" if args.loss_function == "delta" else "grid"
     smoothing_kwargs = configuration.get_smoothing_kwargs(
         args.loss_function, msfm_conf, dlss_conf, net_conf, dir_base=dir_model
@@ -544,7 +577,7 @@ def training():
     # like https://www.tensorflow.org/tutorials/distribute/input#tfdistributestrategydistribute_datasets_from_function
     def train_dataset_fn(input_context):
         dset = train_pipeline.get_dset(
-            tfr_pattern=args.train_tfr_pattern,
+            file_pattern=args.train_file_pattern,
             **dset_kwargs,
             # distribution
             input_context=input_context,
@@ -704,7 +737,7 @@ def training():
 
         # fall back to the training tfrecords when no explicit validation pattern is given;
         # the split is fully determined by signal_indices + is_eval in the validation config.
-        grid_vali_tfr = args.grid_vali_tfr_pattern or (args.train_tfr_pattern if training_type == "grid" else None)
+        grid_vali_tfr = args.grid_vali_file_pattern or (args.train_file_pattern if training_type == "grid" else None)
 
         def make_validation_loop(dist_dset, step_fn, n_expected, summary_map):
             def validation_loop():
@@ -723,7 +756,7 @@ def training():
                     m.reset_states()
             return validation_loop
 
-        if args.fidu_vali_tfr_pattern is not None:
+        if args.fidu_vali_file_pattern is not None:
             vali_dset_kwargs.update(net_conf["dset"]["validation"]["fiducial"])
 
             if args.loss_function == "delta":
@@ -792,7 +825,7 @@ def training():
 
             def vali_dset_fn(input_context):
                 dset = vali_fidu_pipe.get_dset(
-                    tfr_pattern=args.fidu_vali_tfr_pattern,
+                    file_pattern=args.fidu_vali_file_pattern,
                     **vali_dset_kwargs,
                     input_context=input_context,
                     downsample_nside=smooth_nside if parent_output_idx is not None else None,
@@ -834,7 +867,7 @@ def training():
 
             def vali_dset_fn(input_context):
                 dset = vali_grid_pipe.get_dset(
-                    tfr_pattern=grid_vali_tfr,
+                    file_pattern=grid_vali_tfr,
                     **vali_dset_kwargs,
                     input_context=input_context,
                     downsample_nside=smooth_nside if parent_output_idx is not None else None,
@@ -961,7 +994,7 @@ def training():
                     if training_type == "fiducial":
                         out_file = evaluation.evaluate_fiducial(
                             model=model,
-                            tfr_pattern=args.train_tfr_pattern,
+                            file_pattern=args.train_file_pattern,
                             msfm_conf=msfm_conf,
                             dlss_conf=dlss_conf,
                             net_conf=net_conf,
@@ -973,7 +1006,7 @@ def training():
                     elif training_type == "grid":
                         out_file = evaluation.evaluate_grid(
                             model=model,
-                            tfr_pattern=args.train_tfr_pattern,
+                            file_pattern=args.train_file_pattern,
                             msfm_conf=msfm_conf,
                             dlss_conf=dlss_conf,
                             net_conf=net_conf,
@@ -985,10 +1018,10 @@ def training():
                     LOGGER.warning(f"Skipping evaluation of the fiducial training set")
 
                 # fiducial evaluation
-                if args.fidu_eval_tfr_pattern is not None:
+                if args.fidu_eval_file_pattern is not None:
                     out_file = evaluation.evaluate_fiducial(
                         model=model,
-                        tfr_pattern=args.fidu_eval_tfr_pattern,
+                        file_pattern=args.fidu_eval_file_pattern,
                         msfm_conf=msfm_conf,
                         dlss_conf=dlss_conf,
                         net_conf=net_conf,
@@ -1001,10 +1034,10 @@ def training():
                     LOGGER.warning(f"Skipping evaluation of the fiducial evaluation set")
 
                 # grid evaluation
-                if args.grid_eval_tfr_pattern is not None:
+                if args.grid_eval_file_pattern is not None:
                     out_file = evaluation.evaluate_grid(
                         model=model,
-                        tfr_pattern=args.grid_eval_tfr_pattern,
+                        file_pattern=args.grid_eval_file_pattern,
                         msfm_conf=msfm_conf,
                         dlss_conf=dlss_conf,
                         net_conf=net_conf,
