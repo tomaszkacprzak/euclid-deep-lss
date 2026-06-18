@@ -3,152 +3,132 @@
 """
 Created February 2024
 Author: Arne Thomsen
+
+PyTorch optimizer and learning-rate scheduler helpers.
 """
 
-import tensorflow as tf
+import math
+
+from torch.optim import Adam, AdamW, SGD
+from torch.optim.lr_scheduler import LinearLR, _LRScheduler
 
 from msfm.utils import logger
 
 LOGGER = logger.get_logger(__file__)
 
 
-def get_optimizer(net_conf, loss_function="delta_loss", restore_checkpoint=False):
+def _torch_optimizer_kwargs(config):
+    """Translate legacy Keras optimizer kwargs to torch.optim kwargs."""
+    kwargs = dict(config or {})
+    beta_1 = kwargs.pop("beta_1", None)
+    beta_2 = kwargs.pop("beta_2", None)
+    if beta_1 is not None or beta_2 is not None:
+        kwargs["betas"] = (0.9 if beta_1 is None else float(beta_1), 0.999 if beta_2 is None else float(beta_2))
+    return kwargs
+
+
+class LinearWarmupCosineDecaySchedule(_LRScheduler):
+    """Linear warmup followed by cosine decay.
+
+    The constructor intentionally keeps the field names used by the previous
+    Keras schedule configuration: ``initial_learning_rate`` is the first warmup
+    LR, ``warmup_target`` is the peak/base LR, ``decay_steps`` is the number of
+    post-warmup scheduler steps, and ``alpha`` is the final LR as a fraction of
+    ``warmup_target``.
     """
-    Get the correctly configured optimizer for the neural network.
 
-    Args:
-        net_conf (dict): The configuration dictionary for the neural network, which must be of a specific structure.
-        loss_function (str, optional): The loss function to be used, which must be 'delta_loss' or 'likelihood_loss',
-            to be used to read the configuration. Defaults to "delta_loss".
-        restore_checkpoint (bool, optional): Whether the model has been restored from a checkpoint. Defaults to False.
+    def __init__(self, optimizer, initial_learning_rate, warmup_steps, warmup_target, decay_steps, alpha, last_epoch=-1):
+        self.warmup_init_learning_rate = float(initial_learning_rate)
+        self.warmup_steps = int(warmup_steps)
+        self.learning_rate = float(warmup_target)
+        self.decay_steps = max(1, int(decay_steps))
+        self.decay_alpha = float(alpha)
+        super().__init__(optimizer, last_epoch=last_epoch)
 
-    Raises:
-        NotImplementedError: If the loss function is not implemented.
-        NotImplementedError: If the optimizer is not implemented.
-        ValueError: If the optimizer is unknown.
+    def get_lr(self):
+        step = max(0, self.last_epoch)
+        if self.warmup_steps > 0 and step < self.warmup_steps:
+            progress = step / float(self.warmup_steps)
+            lr = self.warmup_init_learning_rate + progress * (self.learning_rate - self.warmup_init_learning_rate)
+        else:
+            decay_step = min(step - self.warmup_steps, self.decay_steps)
+            cosine = 0.5 * (1.0 + math.cos(math.pi * decay_step / self.decay_steps))
+            decayed = (1.0 - self.decay_alpha) * cosine + self.decay_alpha
+            lr = self.learning_rate * decayed
+        return [lr for _ in self.optimizer.param_groups]
+
+
+def get_scheduler(optimizer, net_conf, loss_function="delta"):
+    """Return a torch LR scheduler and cadence (``"step"`` or ``"epoch"``)."""
+    assert loss_function in ["delta", "likelihood", "mutual_info"]
+    loss_key = loss_function + "_loss"
+    opt_conf = net_conf["optimization"][loss_key]
+    scheduler = opt_conf.get("scheduler")
+    learning_rate = float(opt_conf["learning_rate"])
+
+    if scheduler is None:
+        LOGGER.info(f"Using constant learning rate {learning_rate}")
+        return None, None
+    if scheduler == "cosine":
+        warmup_steps = int(opt_conf["warmup_steps"])
+        decay_steps = int(net_conf["training"]["n_steps"]) - warmup_steps
+        LOGGER.info("Using cosine learning rate schedule with warmup")
+        return (
+            LinearWarmupCosineDecaySchedule(
+                optimizer=optimizer,
+                initial_learning_rate=float(opt_conf["warmup_init_learning_rate"]),
+                warmup_steps=warmup_steps,
+                warmup_target=learning_rate,
+                decay_steps=decay_steps,
+                alpha=float(opt_conf["decay_alpha"]),
+            ),
+            "step",
+        )
+    if scheduler == "warmup":
+        start_factor = float(opt_conf["warmup_init_learning_rate"]) / learning_rate
+        LOGGER.info("Using linear warmup learning rate schedule")
+        return (
+            LinearLR(
+                optimizer,
+                start_factor=start_factor,
+                end_factor=1.0,
+                total_iters=int(opt_conf["warmup_steps"]),
+            ),
+            "step",
+        )
+    raise NotImplementedError(f"Scheduler {scheduler} not implemented yet")
+
+
+def get_optimizer(net_conf, loss_function="delta", restore_checkpoint=False, parameters=None):
+    """Create a PyTorch optimizer plus LR scheduler.
 
     Returns:
-        tf.keras.optimizers.Optimizer: The optimizer for the neural network.
+        tuple[torch.optim.Optimizer, torch.optim.lr_scheduler._LRScheduler | None, str | None]:
+        optimizer, scheduler, and scheduler cadence. Step-cadence schedulers
+        should be advanced once after every optimizer update; epoch-cadence
+        schedulers should be advanced after each epoch.
     """
-
-    # assert not restore_checkpoint, "Handling of models restored from checkpoints is not implemented yet."
+    del restore_checkpoint  # Optimizer state is restored by torch checkpoints, not constructed here.
+    if parameters is None:
+        raise ValueError("PyTorch optimizers require model parameters; pass parameters=model.parameters().")
     assert loss_function in ["delta", "likelihood", "mutual_info"]
-    loss_function = loss_function + "_loss"
+    loss_key = loss_function + "_loss"
+    opt_conf = net_conf["optimization"][loss_key]
+    learning_rate = float(opt_conf["learning_rate"])
+    optimizer_name = net_conf["optimization"]["optimizer"].lower()
+    kwargs = _torch_optimizer_kwargs(opt_conf.get("optimizer_kwargs", {}))
 
-    # set up learning rate scheduler
-    scheduler = net_conf["optimization"][loss_function]["scheduler"]
-    learning_rate = float(net_conf["optimization"][loss_function]["learning_rate"])
-    if scheduler is None:
-        learning_rate_schedule = learning_rate
-        LOGGER.info(f"Using constant learning rate {learning_rate}")
-    elif scheduler == "cosine":
-        warmup_init_learning_rate = float(net_conf["optimization"][loss_function]["warmup_init_learning_rate"])
-        warmup_steps = net_conf["optimization"][loss_function]["warmup_steps"]
-        decay_steps = net_conf["training"]["n_steps"] - warmup_steps
-        end_divided_by_init_learning_rate = net_conf["optimization"][loss_function]["decay_alpha"]
-
-        try:
-            learning_rate_schedule = tf.keras.optimizers.schedules.CosineDecay(
-                # warmup
-                initial_learning_rate=warmup_init_learning_rate,
-                warmup_steps=warmup_steps,
-                warmup_target=learning_rate,
-                # decay
-                decay_steps=decay_steps,
-                alpha=end_divided_by_init_learning_rate,
-            )
-        # for TensorFlow 2.9
-        except TypeError:
-            learning_rate_schedule = LinearWarmupCosineDecaySchedule(
-                # warmup
-                initial_learning_rate=warmup_init_learning_rate,
-                warmup_steps=warmup_steps,
-                warmup_target=learning_rate,
-                # decay
-                decay_steps=decay_steps,
-                alpha=end_divided_by_init_learning_rate,
-            )
-        LOGGER.info(f"Using cosine learning rate schedule with warmup")
-    elif scheduler == "warmup":
-        warmup_init_learning_rate = net_conf["optimization"][loss_function]["warmup_init_learning_rate"]
-        warmup_steps = net_conf["optimization"][loss_function]["warmup_steps"]
-
-        learning_rate_schedule = tf.keras.optimizers.schedules.PolynomialDecay(
-            initial_learning_rate=warmup_init_learning_rate,
-            decay_steps=warmup_steps,
-            end_learning_rate=learning_rate,
-            power=1.0,
-            cycle=False,
-        )
-    else:
-        raise NotImplementedError(f"Scheduler {scheduler} not implemented yet")
-
-    # set up optimizer
-    optimizer_name = net_conf["optimization"]["optimizer"]
-    ema_momentum = net_conf["optimization"][loss_function].get("ema_momentum", None)
     if optimizer_name == "adam":
-        if ema_momentum is not None:
-            optimizer = tf.keras.optimizers.Adam(
-                learning_rate=learning_rate_schedule,
-                use_ema=True,
-                ema_momentum=float(ema_momentum),
-                **net_conf["optimization"][loss_function]["optimizer_kwargs"],
-            )
-            LOGGER.info(f"Using Adam optimizer (non-legacy, EMA momentum={ema_momentum})")
-        else:
-            optimizer = tf.keras.optimizers.legacy.Adam(
-                learning_rate=learning_rate_schedule, **net_conf["optimization"][loss_function]["optimizer_kwargs"]
-            )
-            LOGGER.info(f"Using Adam optimizer")
+        optimizer = Adam(parameters, lr=learning_rate, **kwargs)
+        LOGGER.info("Using torch.optim.Adam optimizer")
+    elif optimizer_name == "adamw":
+        optimizer = AdamW(parameters, lr=learning_rate, **kwargs)
+        LOGGER.info("Using torch.optim.AdamW optimizer")
     elif optimizer_name == "sgd":
-        optimizer = tf.keras.optimizers.SGD(
-            learning_rate=learning_rate_schedule, **net_conf["optimization"][loss_function]["optimizer_kwargs"]
-        )
-        LOGGER.info(f"Using SGD optimizer")
+        optimizer = SGD(parameters, lr=learning_rate, **kwargs)
+        LOGGER.info("Using torch.optim.SGD optimizer")
     else:
         raise ValueError(f"Unknown optimizer {optimizer_name}")
 
-    if tf.keras.mixed_precision.global_policy().name == "mixed_float16":
-        LOGGER.info(f"Rescaling the optimizer for mixed precision")
-        optimizer = tf.keras.mixed_precision.LossScaleOptimizer(optimizer)
-    elif tf.keras.mixed_precision.global_policy().name == "mixed_bfloat16":
-        raise NotImplementedError("bfloat16 mixed precision not implemented yet")
-
-    return optimizer
-
-
-class LinearWarmupCosineDecaySchedule(tf.keras.optimizers.schedules.LearningRateSchedule):
-    """Combined learning rate schedule where first there is a linear warmup, followed by a Cosine decay.
-
-    For TensorFlow 2.15 this is not necessary since the CosineDecay already implements this. But for TensorFlow 2.9 as
-    on Perlmutter, we need to implement this ourselves. This custom version should be compatible with the TensorFlow
-    2.15 one.
-    """
-
-    def __init__(self, initial_learning_rate, warmup_steps, warmup_target, decay_steps, alpha):
-        super(LinearWarmupCosineDecaySchedule, self).__init__()
-
-        # warmup
-        self.warmup_init_learning_rate = initial_learning_rate
-        self.warmup_steps = warmup_steps
-        self.learning_rate = warmup_target
-
-        # decay
-        self.decay_steps = decay_steps
-        self.decay_alpha = alpha
-
-    def __call__(self, step):
-        linear_warmup = tf.keras.optimizers.schedules.PolynomialDecay(
-            initial_learning_rate=self.warmup_init_learning_rate,
-            decay_steps=self.warmup_steps,
-            end_learning_rate=self.learning_rate,
-            power=1.0,
-            cycle=False,
-        )
-        cosine_decay = tf.keras.optimizers.schedules.CosineDecay(
-            initial_learning_rate=self.learning_rate, decay_steps=self.decay_steps, alpha=self.decay_alpha
-        )
-
-        return tf.cond(
-            step < self.warmup_steps, lambda: linear_warmup(step), lambda: cosine_decay(step - self.warmup_steps)
-        )
+    scheduler, cadence = get_scheduler(optimizer, net_conf, loss_function)
+    return optimizer, scheduler, cadence

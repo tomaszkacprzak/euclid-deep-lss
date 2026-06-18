@@ -83,6 +83,7 @@ from msfm.utils import logger, input_output, files, parameters
 from deep_lss.utils import distribute, configuration, evaluation, optimization, delta_loss
 from deep_lss.models.delta_model import DeltaLossModel
 from deep_lss.models.grid_model import GridLossModel
+from deep_lss.utils.distribute import TorchDistributedContext
 from deep_lss.nets import NETWORKS
 from deep_lss.nets.maps_plus_cls_network import MapsPlusCLSNetwork
 from deep_lss.nets.regression_head import get_cls_embedding_layers
@@ -111,9 +112,9 @@ def setup():
         help="loss function to train with. If omitted, read from loss_function key in the loss config.",
     )
     parser.add_argument("--dist_strategy",
-        choices=[None, "ddp"],
-        default=None,
-        help="PyTorch distribution strategy; use None to run locally",
+        choices=["none", "ddp", "single_gpu"],
+        default="none",
+        help="PyTorch distribution backend: none, single_gpu, or ddp",
     )
     parser.add_argument("--train_record_pattern",
         type=str,
@@ -298,6 +299,9 @@ def setup():
             f"supported"
         )
 
+        if args.dist_strategy == "ddp":
+            LOGGER.warning("XLA is a TensorFlow option and is not used by the PyTorch DDP backend")
+
     if args.debug:
         tf.config.run_functions_eagerly(True)
         # tf.config.set_soft_device_placement(False)
@@ -463,9 +467,9 @@ def training():
                 f.write(wandb_run.id)
 
         if args.wandb_sweep_id is not None:
-            if args.world_size > 1:
-                # only rank 0 gets an agent, which provides the hyperparameters
-                if args.rank == 0:
+            if isinstance(strategy, TorchDistributedContext) and strategy.world_size > 1:
+                # only the chief gets an agent, which provides the hyperparameters
+                if strategy.rank == 0:
                     nested_hyperparam_conf = configuration.convert_dotted_to_nested_dict(wandb_run.config)
                     net_conf = configuration.update_nested_dict(net_conf, nested_hyperparam_conf["net"])
 
@@ -975,6 +979,7 @@ def training():
                     loss = model.grid_train_step(x_batch, cosmo_batch)
             t_compute_end = time()
 
+
             # delta loss
             if args.loss_function == "delta" and not args.restore_checkpoint and noise_schedule_steps is not None:
                 # assignment has to happen outside the tf.function
@@ -1170,10 +1175,9 @@ if __name__ == "__main__":
         training()
     else:
         if args.dist_strategy == "ddp":
-            _setup_torch_device(args)
-            if args.rank == 0:
+            strategy = distribute.get_strategy(args.dist_strategy)
+            if strategy.rank == 0:
                 wandb.agent(args.wandb_sweep_id, function=training, project="y3-deep-lss", count=1)
-            # the workers get the agent's hyperparameters via broadcast
             else:
                 training()
         else:

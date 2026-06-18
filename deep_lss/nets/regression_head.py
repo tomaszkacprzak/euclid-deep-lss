@@ -1,84 +1,67 @@
 # Copyright (C) 2024 ETH Zurich, Institute for Particle Physics and Astrophysics
+"""PyTorch regression-head builders used by Deep LSS networks."""
 
-"""
-Created March 2024
-Author: Arne Thomsen
-"""
+from __future__ import annotations
 
-import tensorflow as tf
+from torch import nn
 
-from deepsphere import healpy_layers
-from msfm.utils import logger
+from deep_lss.nets import deepsphere_torch as dst
+import logging
 
-LOGGER = logger.get_logger(__file__)
+try:
+    from msfm.utils import logger
+except ImportError:
+    logger = None
 
-
-class MeanLayer(tf.keras.layers.Layer):
-    def __init__(self, axis, **kwargs):
-        super(MeanLayer, self).__init__(**kwargs)
-        self.axis = axis
-
-    def call(self, inputs):
-        return tf.reduce_mean(inputs, axis=self.axis)
+LOGGER = logger.get_logger(__file__) if logger is not None else logging.getLogger(__name__)
+MeanLayer = dst.MeanLayer
 
 
 def get_regression_head(
     out_features,
     head_type="dense",
-    # dense
     dense_layers=None,
+    second_to_last_features=None,
     activation="relu",
     dropout_rate=None,
-    # convolutional
     poly_degree=5,
-    norm_kwargs={},
+    norm_kwargs=None,
 ):
-    """Build the regression head layers.
+    """Build a regression head as a list of ``torch.nn.Module`` layers.
 
-    The dense head always starts with [Flatten, LayerNorm, …] so that
-    ``head_layers_no_flatten = head[1:]`` is valid in ResNetLayers.
-
-    Args:
-        out_features: Output dimension.
-        head_type: ``"dense"`` or ``"conv"``.
-        dense_layers: List of hidden layer widths, e.g. ``[512, 128]``.  Each entry adds
-            Dense(hᵢ, activation) → LayerNorm.
-        activation: Activation for hidden dense layers.
-        dropout_rate: Dropout rate applied after hidden layers (mutually exclusive with hidden layers).
-        poly_degree: Chebyshev degree for the convolutional head.
-        norm_kwargs: Extra kwargs for LayerNormalization.
+    Existing YAML keys are preserved: ``second_to_last_features`` is treated as
+    a one-layer ``dense_layers`` specification when ``dense_layers`` is absent.
     """
-    layers = []
+    norm_kwargs = norm_kwargs or {}
+    layers: list[nn.Module] = []
 
     if head_type == "dense":
         LOGGER.info("Using a dense regression head")
+        if dense_layers is None and second_to_last_features is not None:
+            dense_layers = [second_to_last_features]
 
-        layers.append(tf.keras.layers.Flatten())
-        layers.append(tf.keras.layers.LayerNormalization(axis=-1))
+        layers.append(dst.Flatten())
+        layers.append(dst.LazyLayerNorm(**norm_kwargs))
 
         if dense_layers is not None:
             LOGGER.warning(f"Using dense_layers={dense_layers} in the regression head")
             for h in dense_layers:
-                layers.append(tf.keras.layers.Dense(h, activation=activation))
-                layers.append(tf.keras.layers.LayerNormalization(axis=-1))
+                layers.append(dst.dense(h, activation=activation))
+                layers.append(dst.LazyLayerNorm(**norm_kwargs))
 
         if dropout_rate is not None:
-            assert not dense_layers, \
-                "Dropout and hidden dense layers should not be used together"
+            assert not dense_layers, "Dropout and hidden dense layers should not be used together"
             LOGGER.warning(f"Using dropout with probability {dropout_rate} in the regression head")
-            layers.append(tf.keras.layers.Dropout(dropout_rate))
+            layers.append(nn.Dropout(dropout_rate))
 
-        layers.append(tf.keras.layers.Dense(out_features))
+        layers.append(nn.LazyLinear(out_features))
 
     elif head_type == "conv":
         assert dropout_rate is None, "Dropout not supported for convolutional head"
-
         LOGGER.info("Using a convolutional + averaging regression head")
-
-        layers.append(tf.keras.layers.LayerNormalization(axis=-1, **norm_kwargs))
-        layers.append(healpy_layers.HealpyChebyshev(K=poly_degree, Fout=out_features, activation=None))
-        layers.append(MeanLayer(axis=-2, dtype=tf.float32))
-
+        layers.append(dst.LazyLayerNorm(**norm_kwargs))
+        layers.append(dst.healpy_chebyshev(K=poly_degree, Fout=out_features, activation=None))
+        layers.append(dst.MeanLayer(axis=-2))
     else:
         raise ValueError(f"Unknown regression head type: {head_type}")
 
@@ -86,23 +69,13 @@ def get_regression_head(
 
 
 def get_cls_embedding_layers(hidden_layers, dropout_rate=None, activation="relu"):
-    """Build an MLP to embed binned Cls before fusion with map features in MapsPlusCLSNetwork.
-
-    Args:
-        hidden_layers: List of int widths, e.g. ``[512, 512, 512, 512]``.
-            ``None`` or empty list → returns ``[]`` (no embedding).
-        dropout_rate: Optional float; a single Dropout appended after all hidden layers.
-        activation: Activation for hidden Dense layers.
-
-    Returns:
-        List of Keras layers: interleaved Dense + LayerNorm, with optional trailing Dropout.
-    """
+    """Build a PyTorch MLP for binned Cl embeddings."""
     if not hidden_layers:
         return []
-    layers = []
+    layers: list[nn.Module] = []
     for h in hidden_layers:
-        layers.append(tf.keras.layers.Dense(h, activation=activation))
-        layers.append(tf.keras.layers.LayerNormalization(axis=-1))
+        layers.append(dst.dense(h, activation=activation))
+        layers.append(dst.LazyLayerNorm())
     if dropout_rate is not None:
-        layers.append(tf.keras.layers.Dropout(dropout_rate))
+        layers.append(nn.Dropout(dropout_rate))
     return layers
