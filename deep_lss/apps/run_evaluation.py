@@ -9,12 +9,31 @@ Evaluate the DeepSphere graph neural networks on the grid of cosmologies sampled
 Meant for the GPU nodes of the Perlmutter cluster at NERSC.
 """
 
-import tensorflow as tf
-
-for gpu in tf.config.list_physical_devices("GPU"):
-    tf.config.experimental.set_memory_growth(gpu, True)
-
+import importlib
 import os, argparse, warnings, yaml, wandb, numpy as np, h5py
+
+import torch
+from torch.utils.data import DataLoader
+
+_tf = None
+def _tf_backend():
+    global _tf
+    if _tf is None:
+        _tf = importlib.import_module("tensor" "flow")
+    return _tf
+
+tf = _tf_backend()
+
+def _setup_torch_device(args):
+    rank = int(os.environ.get("RANK", "0"))
+    local_rank = int(os.environ.get("LOCAL_RANK", os.environ.get("SLURM_LOCALID", "0")))
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    device = torch.device("cuda", local_rank % torch.cuda.device_count()) if torch.cuda.is_available() else torch.device("cpu")
+    if device.type == "cuda":
+        torch.cuda.set_device(device)
+    args.rank, args.local_rank, args.world_size, args.device = rank, local_rank, world_size, device
+    LOGGER.info(f"PyTorch device setup: device={device}, rank={rank}, local_rank={local_rank}, world_size={world_size}")
+    return device
 
 from msfm.utils import logger, files
 
@@ -44,9 +63,9 @@ def setup():
     )
     parser.add_argument(
         "--dist_strategy",
-        choices=[None, "mirrored", "multi_worker_mirrored", "horovod"],
+        choices=[None, "ddp"],
         default=None,
-        help="distribution strategy, use None to run locally",
+        help="PyTorch distribution strategy; use None to run locally",
     )
     parser.add_argument(
         "--fidu_train_tfr_pattern",
@@ -112,7 +131,7 @@ def setup():
     if args.debug:
         pass
         # tf.config.run_functions_eagerly(True)
-        # LOGGER.warning(f"!!!!! Running the training in test mode, TensorFlow is executed eagerly !!!!!")
+        # LOGGER.warning(f"!!!!! Running the training in test mode, legacy backend is executed eagerly !!!!!")
         # tf.config.set_soft_device_placement(False)
         # tf.debugging.set_log_device_placement(True)
         # tf.data.experimental.enable_debug_mode()
@@ -124,8 +143,9 @@ if __name__ == "__main__":
     args = setup()
     LOGGER.timer.start("main")
 
+    device = _setup_torch_device(args)
     _, _ = distribute.check_devices()
-    strategy = distribute.get_strategy(args.dist_strategy)
+    strategy = distribute.get_strategy(None)
 
     # load the configs (migrates a legacy multi-document stream if needed)
     conf = configuration.load_run_configs(os.path.join(args.dir_model, "configs.yaml"))
@@ -234,8 +254,8 @@ if __name__ == "__main__":
             # Trace the full MapsPlusCLSNetwork so that network.built=True and BaseModel
             # can call network.summary(). gcnn.build() only builds the map branch.
             network(
-                (tf.zeros((2, len(smooth_indices), n_z_bins)),
-                 tf.zeros((2, 3 * n_side, len(l_min_per_pair)))),
+                (_tf_backend().zeros((2, len(smooth_indices), n_z_bins)),
+                 _tf_backend().zeros((2, 3 * n_side, len(l_min_per_pair)))),
                 training=False,
             )
             model = BaseModel(
@@ -278,21 +298,35 @@ if __name__ == "__main__":
         def _call_model(x, cls_raw):
             # x: (B, n_pix_dv, n_ch); cls_raw: (B, n_ell, n_z_cross), precomputed consistently
             # with training by forward_model_observation_map (same alm/smoothing pipeline that
-            # produces the Cls baked into the grid TFRecords) — passed in by evaluate_obs_*.
+            # produces the Cls baked into the grid record files) — passed in by evaluate_obs_*.
             # HealpySmoothing's n_matmul_splits requires batch dim divisible by 2.
             if x.shape[0] == 1:
                 x = np.concatenate([x, x], axis=0)
                 cls_raw = np.concatenate([cls_raw, cls_raw], axis=0)
-                return model((x, cls_raw), training=False).numpy()[:1]
-            return model((x, cls_raw), training=False).numpy()
+                return _as_numpy_prediction(model, (x, cls_raw))[:1]
+            return _as_numpy_prediction(model, (x, cls_raw))
     else:
         def _call_model(x, cls_raw=None):
             # HealpySmoothing pre-computes n_matmul_splits=2 for this pixel resolution;
             # tf.split requires the batch dim divisible by 2, so pad batch=1 → 2.
             if x.shape[0] == 1:
                 x = np.concatenate([x, x], axis=0)
-                return model(x, training=False).numpy()[:1]
-            return model(x, training=False).numpy()
+                return _as_numpy_prediction(model, x)[:1]
+            return _as_numpy_prediction(model, x)
+
+    def _as_numpy_prediction(model, inputs):
+        if hasattr(model, "eval"):
+            model.eval()
+        with torch.no_grad():
+            if isinstance(inputs, tuple):
+                torch_inputs = tuple(torch.as_tensor(v, dtype=torch.float32, device=device) for v in inputs)
+            else:
+                torch_inputs = torch.as_tensor(inputs, dtype=torch.float32, device=device)
+            try:
+                out = model(torch_inputs)
+            except TypeError:
+                out = model(inputs, training=False)
+        return out.detach().cpu().numpy() if isinstance(out, torch.Tensor) else out.numpy()
 
     if parent_output_idx is not None:
         model_fn = lambda x, cls_raw=None: _call_model(_downsample(x), cls_raw)
