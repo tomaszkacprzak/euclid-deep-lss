@@ -80,7 +80,7 @@ def setup():
     parser.add_argument("--loss_function",
         type=str,
         default=None,
-        choices=["delta", "mse", "likelihood", "mutual_info"],
+        choices=["delta", "mse", "likelihood", "mutual_info", "onthefly_mutual_info"],
         help="loss function to train with. If omitted, read from loss_function key in the loss config.",
     )
     parser.add_argument("--dist_strategy",
@@ -88,27 +88,27 @@ def setup():
         default=None,
         help="distribution strategy, use None to run locally",
     )
-    parser.add_argument("--train_file_pattern",
+    parser.add_argument("--train_record_pattern",
         type=str,
         required=True,
         help="input root dir of the fiducial or grid data vectors (training)",
     )
-    parser.add_argument("--fidu_vali_file_pattern",
+    parser.add_argument("--fidu_vali_record_pattern",
         type=str,
         default=None,
         help="input root dir of the fiducial data vectors (validation)",
     )
-    parser.add_argument("--grid_vali_file_pattern",
+    parser.add_argument("--grid_vali_record_pattern",
         type=str,
         default=None,
         help="input root dir of the grid data vectors (validation)",
     )
-    parser.add_argument("--fidu_eval_file_pattern",
+    parser.add_argument("--fidu_eval_record_pattern",
         type=str,
         default=None,
         help="input root dir of the fiducial data vectors (evaluation)",
     )
-    parser.add_argument("--grid_eval_file_pattern",
+    parser.add_argument("--grid_eval_record_pattern",
         type=str,
         default=None,
         help="input root dir of the grid data vectors (evaluation)",
@@ -233,7 +233,7 @@ def setup():
         raise ValueError(f"summary_every must be >= 1, got {args.summary_every}")
 
     assert not (
-        (args.fidu_vali_file_pattern is not None) and (args.grid_vali_file_pattern is not None)
+        (args.fidu_vali_record_pattern is not None) and (args.grid_vali_record_pattern is not None)
     ), "Only one of the validation sets can be provided"
 
     # set up directories
@@ -510,9 +510,9 @@ def training():
 
     # constants: miscellaneous
     if args.loss_function == "delta":
-        assert "fiducial" in args.train_file_pattern, "The delta loss can only be used for the fiducial dataset"
+        assert "fiducial" in args.train_record_pattern, "The delta loss can only be used for the fiducial dataset"
     else:
-        assert "grid" in args.train_file_pattern, f"The {args.loss_function} loss can only be used for the grid dataset"
+        assert "grid" in args.train_record_pattern, f"The {args.loss_function} loss can only be used for the grid dataset"
     training_type = "fiducial" if args.loss_function == "delta" else "grid"
     smoothing_kwargs = configuration.get_smoothing_kwargs(
         args.loss_function, msfm_conf, dlss_conf, net_conf, dir_base=dir_model
@@ -542,7 +542,7 @@ def training():
             noise_scale = tf.Variable(noise_scheduler(0), trainable=False, dtype=tf.float32)
             noise_kwargs = {"shape_noise_scale": noise_scale, "poisson_noise_scale": noise_scale}
 
-    else:
+    elif args.loss_function in ["likelihood", "mse", "mutual_info"]:
         if args.loss_function == "likelihood":
             n_output = n_params + n_params * (n_params + 1) // 2
         elif args.loss_function == "mse":
@@ -555,16 +555,22 @@ def training():
         local_batch_size = dset_kwargs["local_batch_size"]
         effective_local_batch_size = local_batch_size
 
+    elif args.loss_function == "onthefly_mutual_info":
+
+        # TODO
+        raise NotImplementedError("onthefly_mutual_info is not implemented yet")
+
+
     try:
         n_z_bins = len(dset_kwargs["z_bin_inds"])
     except (KeyError, TypeError):
         n_z_bins = 0
         if with_lensing:
-            n_z_bins += len(msfm_conf["survey"]["metacal"]["z_bins"])
+            n_z_bins += len(msfm_conf["survey"]["WL"]["z_bins"])
         if with_clustering:
-            n_z_bins += len(msfm_conf["survey"]["maglim"]["z_bins"])
+            n_z_bins += len(msfm_conf["survey"]["GC"]["z_bins"])
         if with_cross:
-            n_z_bins += len(msfm_conf["survey"]["metacal"]["z_bins"]) * len(msfm_conf["survey"]["maglim"]["z_bins"])
+            n_z_bins += len(msfm_conf["survey"]["WL"]["z_bins"]) * len(msfm_conf["survey"]["GC"]["z_bins"])
 
     # dataset
     LOGGER.warning(f"Training set")
@@ -577,7 +583,7 @@ def training():
     # like https://www.tensorflow.org/tutorials/distribute/input#tfdistributestrategydistribute_datasets_from_function
     def train_dataset_fn(input_context):
         dset = train_pipeline.get_dset(
-            file_pattern=args.train_file_pattern,
+            record_pattern=args.train_record_pattern,
             **dset_kwargs,
             # distribution
             input_context=input_context,
@@ -737,7 +743,7 @@ def training():
 
         # fall back to the training tfrecords when no explicit validation pattern is given;
         # the split is fully determined by signal_indices + is_eval in the validation config.
-        grid_vali_tfr = args.grid_vali_file_pattern or (args.train_file_pattern if training_type == "grid" else None)
+        grid_vali_tfr = args.grid_vali_record_pattern or (args.train_record_pattern if training_type == "grid" else None)
 
         def make_validation_loop(dist_dset, step_fn, n_expected, summary_map):
             def validation_loop():
@@ -756,7 +762,7 @@ def training():
                     m.reset_states()
             return validation_loop
 
-        if args.fidu_vali_file_pattern is not None:
+        if args.fidu_vali_record_pattern is not None:
             vali_dset_kwargs.update(net_conf["dset"]["validation"]["fiducial"])
 
             if args.loss_function == "delta":
@@ -825,7 +831,7 @@ def training():
 
             def vali_dset_fn(input_context):
                 dset = vali_fidu_pipe.get_dset(
-                    file_pattern=args.fidu_vali_file_pattern,
+                    record_pattern=args.fidu_vali_record_pattern,
                     **vali_dset_kwargs,
                     input_context=input_context,
                     downsample_nside=smooth_nside if parent_output_idx is not None else None,
@@ -867,7 +873,7 @@ def training():
 
             def vali_dset_fn(input_context):
                 dset = vali_grid_pipe.get_dset(
-                    file_pattern=grid_vali_tfr,
+                    record_pattern=grid_vali_tfr,
                     **vali_dset_kwargs,
                     input_context=input_context,
                     downsample_nside=smooth_nside if parent_output_idx is not None else None,
@@ -994,7 +1000,7 @@ def training():
                     if training_type == "fiducial":
                         out_file = evaluation.evaluate_fiducial(
                             model=model,
-                            file_pattern=args.train_file_pattern,
+                            record_pattern=args.train_record_pattern,
                             msfm_conf=msfm_conf,
                             dlss_conf=dlss_conf,
                             net_conf=net_conf,
@@ -1006,7 +1012,7 @@ def training():
                     elif training_type == "grid":
                         out_file = evaluation.evaluate_grid(
                             model=model,
-                            file_pattern=args.train_file_pattern,
+                            record_pattern=args.train_record_pattern,
                             msfm_conf=msfm_conf,
                             dlss_conf=dlss_conf,
                             net_conf=net_conf,
@@ -1018,10 +1024,10 @@ def training():
                     LOGGER.warning(f"Skipping evaluation of the fiducial training set")
 
                 # fiducial evaluation
-                if args.fidu_eval_file_pattern is not None:
+                if args.fidu_eval_record_pattern is not None:
                     out_file = evaluation.evaluate_fiducial(
                         model=model,
-                        file_pattern=args.fidu_eval_file_pattern,
+                        record_pattern=args.fidu_eval_record_pattern,
                         msfm_conf=msfm_conf,
                         dlss_conf=dlss_conf,
                         net_conf=net_conf,
@@ -1034,10 +1040,10 @@ def training():
                     LOGGER.warning(f"Skipping evaluation of the fiducial evaluation set")
 
                 # grid evaluation
-                if args.grid_eval_file_pattern is not None:
+                if args.grid_eval_record_pattern is not None:
                     out_file = evaluation.evaluate_grid(
                         model=model,
-                        file_pattern=args.grid_eval_file_pattern,
+                        record_pattern=args.grid_eval_record_pattern,
                         msfm_conf=msfm_conf,
                         dlss_conf=dlss_conf,
                         net_conf=net_conf,
