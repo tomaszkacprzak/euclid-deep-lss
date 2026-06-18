@@ -518,6 +518,7 @@ def training():
         args.loss_function, msfm_conf, dlss_conf, net_conf, dir_base=dir_model
     )
 
+    # loss function selection
     dset_kwargs = {**net_conf["dset"]["training"]["common"], **data_conf}
     noise_kwargs = {}
     if args.loss_function == "delta":
@@ -556,11 +557,17 @@ def training():
         effective_local_batch_size = local_batch_size
 
     elif args.loss_function == "onthefly_mutual_info":
+        
+        n_output = loss_conf["mutual_info_loss"]["dim_summary_fac"] * n_params
+        from msfm.onthefly_physics.onthefly_linear import OntheflyPhysicsModelLinear
+        Pipeline = OntheflyPhysicsModelLinear
+        Model = GridLossModel
+        dset_kwargs.update(net_conf["dset"]["training"]["grid"])
+        local_batch_size = dset_kwargs["local_batch_size"]
+        effective_local_batch_size = local_batch_size
+        
 
-        # TODO
-        raise NotImplementedError("onthefly_mutual_info is not implemented yet")
-
-
+    # constants: redshift bins
     try:
         n_z_bins = len(dset_kwargs["z_bin_inds"])
     except (KeyError, TypeError):
