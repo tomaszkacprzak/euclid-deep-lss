@@ -12,23 +12,57 @@ from functools import partial
 import h5py
 import matplotlib.pyplot as plt
 import numpy as np
-import tensorflow as tf
+import torch
 
 from deep_lss.utils import evaluation
 from msi.utils import preprocessing
 
+
+def _predict_torch_batches(model, array, batch_size):
+    """Run a PyTorch module/callable on NumPy batches and return NumPy predictions."""
+    preds = []
+    was_training = getattr(model, "training", None)
+    if hasattr(model, "eval"):
+        model.eval()
+    with torch.no_grad():
+        for i in range(0, len(array), batch_size):
+            batch = torch.as_tensor(array[i : i + batch_size], dtype=torch.float32)
+            pred = model(batch)
+            if not isinstance(pred, torch.Tensor):
+                pred = torch.as_tensor(pred)
+            preds.append(pred.detach().cpu().numpy())
+    if was_training and hasattr(model, "train"):
+        model.train()
+    return np.concatenate(preds, axis=0)
+
+
+def _predict_torch(model, array):
+    """Run a PyTorch module/callable on one NumPy array and return NumPy predictions."""
+    was_training = getattr(model, "training", None)
+    if hasattr(model, "eval"):
+        model.eval()
+    with torch.no_grad():
+        pred = model(torch.as_tensor(array, dtype=torch.float32))
+    if was_training and hasattr(model, "train"):
+        model.train()
+    if not isinstance(pred, torch.Tensor):
+        pred = torch.as_tensor(pred)
+    return pred.detach().cpu().numpy()
+
+
 _OBS_PREPROC_FNS = {
-    "hard":             preprocessing.get_preprocessed_cl_observation_hard_cut,
+    "hard": preprocessing.get_preprocessed_cl_observation_hard_cut,
     "hard_conservative": partial(preprocessing.get_preprocessed_cl_observation_hard_cut, n_extra_bins=1),
-    "none":             preprocessing.get_preprocessed_cl_observation_hard_cut,
-    "soft_pruned":      partial(preprocessing.get_preprocessed_cl_observation, scale_cut="soft_pruned"),
-    "soft":             preprocessing.get_preprocessed_cl_observation,
+    "none": preprocessing.get_preprocessed_cl_observation_hard_cut,
+    "soft_pruned": partial(preprocessing.get_preprocessed_cl_observation, scale_cut="soft_pruned"),
+    "soft": preprocessing.get_preprocessed_cl_observation,
 }
 
 
 def _obs_preprocessing_fn(scale_cut, cls_n_bins=None):
     if scale_cut == "hard_rebinned":
         from deep_lss.utils.cls_preprocessing import preprocess_obs_hard_rebinned
+
         return partial(preprocess_obs_hard_rebinned, cls_n_bins=cls_n_bins)
     return _OBS_PREPROC_FNS[scale_cut]
 
@@ -130,13 +164,7 @@ def evaluate_mock_cls(
     )
     obs_cl = np.squeeze(obs_cl)
 
-    fidu_preds = np.concatenate(
-        [
-            model(tf.constant(obs_cl[i : i + batch_size], dtype=tf.float32), training=False).numpy()
-            for i in range(0, len(obs_cl), batch_size)
-        ],
-        axis=0,
-    )
+    fidu_preds = _predict_torch_batches(model, obs_cl, batch_size)
 
     fiducial_cosmo = msfm_params.get_fiducials(params, msfm_conf)
 
@@ -207,5 +235,5 @@ def evaluate_des_y3(
                 apply_maglim_sys_map=apply_sys,
             )
 
-            des_pred = model(tf.constant(des_cl, dtype=tf.float32), training=False).numpy()
+            des_pred = _predict_torch(model, des_cl)
             evaluation.append_obs_to_file(pred_file, f"obs/preds/{sys_label}{rot_suffix}", des_pred)
