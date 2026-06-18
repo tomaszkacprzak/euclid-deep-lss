@@ -62,15 +62,18 @@ def main():
     # TODO: implement
     # TODO: use OntheflyPhysicsModelLinear
     # TODO: use HealpyGCNN resnet
+    # TODO: create a new pytorch HealpyGCNN model in this file, do not refer to other models and networks outside the file,no other files should be modified
     # TODO: use data distributed training
     # TODO: use pytorch only (no tensorflow anywhere!)
     # TODO: support checkpoints, re-starting training from a checkpoint
     # TODO: support wandb
-    # TODO: use variational mutual information maximization loss function, only
+    # TODO: use variational mutual information maximization loss function, only, no other loss functions are supported
     # TODO: support validation on held-out part of the data, every 1000 steps
     # TODO: monitor validation loss and training loss in wandb
     # TODO: training arguments, such as learning rate, batch size, number of epochs, should be hard-coded at the top of the file
     # TODO: make the script as simple as possible, no calls to external functions, classes, modules in this repository, only standard library and external packages that are installed
+    # TODO: use standard pytorch training workflow, as simple as possible
+    # TODO: save model checkpoint at the end of the training
     
 
     pass
