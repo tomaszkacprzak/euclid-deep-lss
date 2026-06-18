@@ -9,6 +9,7 @@ Evaluate the DeepSphere graph neural networks on the CosmoGrid
 
 import numpy as np
 import tensorflow as tf
+import torch
 import os, warnings, h5py, math, logging, wandb
 from trianglechain import TriangleChain
 
@@ -33,6 +34,68 @@ _CLS_ONLY_KEYS = frozenset({"with_cross_z", "with_cross_probe", "ggl_only"})
 _EXPLICIT_PIPELINE_KEYS = frozenset({"return_maps", "return_cls"})
 
 # suppress a specific warning
+
+
+def _to_numpy(value):
+    """Convert tensor-like values to NumPy arrays for HDF5 serialization."""
+    if isinstance(value, torch.Tensor):
+        return value.detach().cpu().numpy()
+    if hasattr(value, "numpy"):
+        return value.numpy()
+    return np.asarray(value)
+
+
+def _to_torch(value):
+    """Convert TensorFlow/NumPy batch values to torch tensors for model calls."""
+    if isinstance(value, torch.Tensor):
+        return value
+    if isinstance(value, (tuple, list)):
+        return type(value)(_to_torch(v) for v in value)
+    return torch.as_tensor(_to_numpy(value))
+
+
+def _call_torch_model(model, x, return_features=False):
+    """Call a PyTorch module or callable wrapper on torch tensors."""
+    x = _to_torch(x)
+    was_training = getattr(model, "training", None)
+    if hasattr(model, "eval"):
+        model.eval()
+    with torch.no_grad():
+        try:
+            args = tuple(x) if isinstance(x, (tuple, list)) else (x,)
+            if return_features:
+                try:
+                    output = model(*args, return_features=True)
+                except TypeError:
+                    output = model(x, return_features=True)
+            else:
+                try:
+                    output = model(*args)
+                except TypeError:
+                    output = model(x)
+        finally:
+            if was_training and hasattr(model, "train"):
+                model.train()
+    return output
+
+
+def _is_tf_evaluation_model(model):
+    return hasattr(model, "tf_call") and hasattr(model, "strategy")
+
+
+def _run_model_batch(model, x, strategy=None, return_features=False, feature_model=None):
+    """Run either the legacy TensorFlow model wrapper or a torch/callable model."""
+    if _is_tf_evaluation_model(model):
+        if return_features:
+            return strategy.run(lambda batch: feature_model(batch, training=False), args=(x,))
+        return strategy.run(model.tf_call, args=(x,))
+    return _call_torch_model(model, x, return_features=return_features)
+
+
+def _gather_if_distributed(value, strategy=None):
+    return strategy.gather(value, axis=0) if strategy is not None else value
+
+
 logging.getLogger("tensorflow").addFilter(
     lambda record: "gather/all_gather with NCCL or HierarchicalCopy is not supported" not in record.getMessage()
 )
@@ -61,15 +124,12 @@ def _stack_grid_cosmos(tensors, sorted_indices, n_examples_per_cosmo):
             axes of the input
     """
     # concatenate all of the cosmologies into the first axis, shape (n_cosmos * n_examples_per_cosmo, None)
-    tensors = tf.concat(tensors, axis=0)
-    # instead of numpy fancy indexing
-    tensors = tf.gather(tensors, sorted_indices)
-    # split according to the cosmology, list of len n_cosmos with elements of shape (n_examples_per_cosmo, None)
-    tensors = tf.split(tensors, tensors.shape[0] // n_examples_per_cosmo)
-    # stack the cosmologies into the 0th axis, shape (n_cosmos, n_examples_per_cosmo, None)
-    tensors = tf.stack(tensors, axis=0)
-
-    return tensors.numpy()
+    tensors = np.concatenate([_to_numpy(tensor) for tensor in tensors], axis=0)
+    sorted_indices = _to_numpy(sorted_indices).astype(np.int64)
+    # instead of framework fancy indexing
+    tensors = tensors[sorted_indices]
+    # split according to the cosmology and stack into shape (n_cosmos, n_examples_per_cosmo, None)
+    return tensors.reshape(tensors.shape[0] // n_examples_per_cosmo, n_examples_per_cosmo, *tensors.shape[1:])
 
 
 def _remove_example_axis(array):
@@ -95,7 +155,16 @@ def _remove_example_axis(array):
 
 
 def evaluate_grid(
-    model, tfr_pattern, msfm_conf, dlss_conf, net_conf, data_conf, dir_out, file_label=None, wandb_run=None, debug=False
+    model,
+    tfr_pattern,
+    msfm_conf,
+    dlss_conf,
+    net_conf,
+    data_conf,
+    dir_out,
+    file_label=None,
+    wandb_run=None,
+    debug=False,
 ):
     """Evaluate the model on the grid part of the CosmoGrid.
 
@@ -117,7 +186,7 @@ def evaluate_grid(
     # network constants
     save_second_to_last_layer = net_conf["network"]["save_second_to_last_layer"]
 
-    strategy = model.strategy
+    strategy = model.strategy if _is_tf_evaluation_model(model) else None
 
     n_side = msfm_conf["analysis"]["n_side"]
     smooth_nside = net_conf["network"].get("smooth_nside", None)
@@ -132,14 +201,19 @@ def evaluate_grid(
 
     grid_pipeline = GridPipeline(
         conf=msfm_conf,
-        **{k: v for k, v in {**dlss_conf["dset"]["common"], **dlss_conf["dset"]["eval"]["grid"]}.items()
-           if k not in _CLS_ONLY_KEYS | _EXPLICIT_PIPELINE_KEYS},
+        **{
+            k: v
+            for k, v in {**dlss_conf["dset"]["common"], **dlss_conf["dset"]["eval"]["grid"]}.items()
+            if k not in _CLS_ONLY_KEYS | _EXPLICIT_PIPELINE_KEYS
+        },
         return_maps=True,
         return_cls=return_cls,
     )
 
     local_batch_size = dset_kwargs["local_batch_size"]
-    global_batch_size = distribute.get_global_batch_size(strategy, local_batch_size)
+    global_batch_size = (
+        distribute.get_global_batch_size(strategy, local_batch_size) if strategy is not None else local_batch_size
+    )
 
     # like https://www.tensorflow.org/tutorials/distribute/input#tfdistributestrategydistribute_datasets_from_function
     def dataset_fn(input_context):
@@ -158,7 +232,7 @@ def evaluate_grid(
 
         return dset
 
-    dist_dset = strategy.distribute_datasets_from_function(dataset_fn)
+    dist_dset = strategy.distribute_datasets_from_function(dataset_fn) if strategy is not None else dataset_fn(None)
 
     n_cosmos = msfm_conf["analysis"]["grid"]["n_cosmos"]
     n_noise = grid_pipeline.n_noise
@@ -169,14 +243,14 @@ def evaluate_grid(
 
     n_batches = math.ceil(n_examples / global_batch_size)
 
-    if n_examples % (strategy.num_replicas_in_sync * local_batch_size) != 0:
+    if n_examples % ((strategy.num_replicas_in_sync if strategy is not None else 1) * local_batch_size) != 0:
         LOGGER.warning(
             f"Number of examples {n_examples} is not divisible by the number of replicas "
-            f"{strategy.num_replicas_in_sync} times the local batch size {local_batch_size}"
+            f"{strategy.num_replicas_in_sync if strategy is not None else 1} times the local batch size {local_batch_size}"
         )
 
     # set up a network that outputs the second to last layer too
-    if save_second_to_last_layer:
+    if save_second_to_last_layer and _is_tf_evaluation_model(model):
         last_layer = model.network.layers[-1]
         second_to_last_layer = model.network.layers[-2]
         two_output_model = tf.keras.Model(
@@ -195,21 +269,26 @@ def evaluate_grid(
         x_batch = (dv_batch, cl_batch) if return_cls else dv_batch
         # DistributedValues of shape (local_batch_size, n_output)
         if save_second_to_last_layer:
-            pred_batch, second_to_last_layer_batch = strategy.run(
-                lambda x: two_output_model(x, training=False), args=(x_batch,)
+            pred_result = _run_model_batch(
+                model,
+                x_batch,
+                strategy=strategy,
+                return_features=True,
+                feature_model=two_output_model if _is_tf_evaluation_model(model) else None,
             )
-            second_to_last_layer_batch = strategy.gather(second_to_last_layer_batch, axis=0)
+            pred_batch, second_to_last_layer_batch = pred_result
+            second_to_last_layer_batch = _gather_if_distributed(second_to_last_layer_batch, strategy)
         else:
-            pred_batch = strategy.run(model.tf_call, args=(x_batch,))
+            pred_batch = _run_model_batch(model, x_batch, strategy=strategy)
 
         # shape (global_batch_size, n_output)
-        pred_batch = strategy.gather(pred_batch, axis=0)
+        pred_batch = _gather_if_distributed(pred_batch, strategy)
         # shape (global_batch_size, n_params)
-        cosmo_batch = strategy.gather(cosmo_batch, axis=0)
+        cosmo_batch = _gather_if_distributed(cosmo_batch, strategy)
         # shape (global_batch_size,) NOTE it's important that gather takes place on the tensor (not tuple) level
-        i_sobol_batch = strategy.gather(index_batch[0], axis=0)
-        i_signal_batch = strategy.gather(index_batch[1], axis=0)
-        i_noise_batch = strategy.gather(index_batch[2], axis=0)
+        i_sobol_batch = _gather_if_distributed(index_batch[0], strategy)
+        i_signal_batch = _gather_if_distributed(index_batch[1], strategy)
+        i_noise_batch = _gather_if_distributed(index_batch[2], strategy)
 
         preds.append(pred_batch)
         cosmos.append(cosmo_batch)
@@ -220,7 +299,7 @@ def evaluate_grid(
             second_to_last_layer.append(second_to_last_layer_batch)
 
     # sort according to the sobol index
-    sorted_indices = tf.argsort(tf.concat(i_sobols, axis=0), axis=0, stable=True)
+    sorted_indices = np.argsort(np.concatenate([_to_numpy(x) for x in i_sobols], axis=0), axis=0, kind="stable")
 
     # shape (n_cosmos, n_examples_per_cosmo, None)
     preds = _stack_grid_cosmos(preds, sorted_indices, n_examples_per_cosmo)
@@ -229,7 +308,7 @@ def evaluate_grid(
     i_noises = _stack_grid_cosmos(i_noises, sorted_indices, n_examples_per_cosmo)
     i_signals = _stack_grid_cosmos(i_signals, sorted_indices, n_examples_per_cosmo)
     if save_second_to_last_layer:
-        second_to_last_layer = _stack_grid_cosmos(second_to_last_layer_batch, sorted_indices, n_examples_per_cosmo)
+        second_to_last_layer = _stack_grid_cosmos(second_to_last_layer, sorted_indices, n_examples_per_cosmo)
     LOGGER.info(f"Reshaped the results")
 
     out_file = _get_out_file(dir_out, file_label)
@@ -258,7 +337,9 @@ def evaluate_grid(
 
         LOGGER.info(f"Evaluation of the grid has finished, saved the predictions in {out_file}")
 
-    if isinstance(model.strategy, (tf.distribute.MultiWorkerMirroredStrategy, HorovodStrategy)):
+    if _is_tf_evaluation_model(model) and isinstance(
+        model.strategy, (tf.distribute.MultiWorkerMirroredStrategy, HorovodStrategy)
+    ):
         if model.is_chief():
             LOGGER.info(f"Chief here")
             write_out_file()
@@ -274,7 +355,16 @@ def evaluate_grid(
 
 
 def evaluate_fiducial(
-    model, tfr_pattern, msfm_conf, dlss_conf, net_conf, data_conf, dir_out, training_set=True, file_label=None, wandb_run=None
+    model,
+    tfr_pattern,
+    msfm_conf,
+    dlss_conf,
+    net_conf,
+    data_conf,
+    dir_out,
+    training_set=True,
+    file_label=None,
+    wandb_run=None,
 ):
     """Evaluate the model on the fiducial part of the CosmoGrid.
 
@@ -311,15 +401,17 @@ def evaluate_fiducial(
     # network constants
     save_second_to_last_layer = net_conf["network"]["save_second_to_last_layer"]
 
-    strategy = model.strategy
+    strategy = model.strategy if _is_tf_evaluation_model(model) else None
     local_batch_size = dset_kwargs["local_batch_size"]
-    global_batch_size = distribute.get_global_batch_size(strategy, local_batch_size)
+    global_batch_size = (
+        distribute.get_global_batch_size(strategy, local_batch_size) if strategy is not None else local_batch_size
+    )
     n_batches = math.ceil(n_examples / global_batch_size)
 
-    if n_examples % (strategy.num_replicas_in_sync * local_batch_size) != 0:
+    if n_examples % ((strategy.num_replicas_in_sync if strategy is not None else 1) * local_batch_size) != 0:
         LOGGER.warning(
             f"Number of examples {n_examples} is not divisible by the number of replicas "
-            f"{strategy.num_replicas_in_sync} times the local batch size {local_batch_size}"
+            f"{strategy.num_replicas_in_sync if strategy is not None else 1} times the local batch size {local_batch_size}"
         )
 
     n_side = msfm_conf["analysis"]["n_side"]
@@ -333,8 +425,11 @@ def evaluate_fiducial(
 
     fiducial_pipeline = FiducialPipeline(
         conf=msfm_conf,
-        **{k: v for k, v in {**dlss_conf["dset"]["common"], **dlss_conf["dset"]["eval"]["fiducial"]}.items()
-           if k not in _CLS_ONLY_KEYS | _EXPLICIT_PIPELINE_KEYS},
+        **{
+            k: v
+            for k, v in {**dlss_conf["dset"]["common"], **dlss_conf["dset"]["eval"]["fiducial"]}.items()
+            if k not in _CLS_ONLY_KEYS | _EXPLICIT_PIPELINE_KEYS
+        },
         return_maps=True,
         return_cls="cls_n_bins" in net_conf["network"],
     )
@@ -353,10 +448,10 @@ def evaluate_fiducial(
 
         return dset
 
-    dist_dset = strategy.distribute_datasets_from_function(dataset_fn)
+    dist_dset = strategy.distribute_datasets_from_function(dataset_fn) if strategy is not None else dataset_fn(None)
 
     # set up a network that outputs the second to last layer too
-    if save_second_to_last_layer:
+    if save_second_to_last_layer and _is_tf_evaluation_model(model):
         last_layer = model.network.layers[-1]
         second_to_last_layer = model.network.layers[-2]
         two_output_model = tf.keras.Model(
@@ -372,18 +467,23 @@ def evaluate_fiducial(
     ):
         # DistributedValues of shape (local_batch_size, n_output)
         if save_second_to_last_layer:
-            pred_batch, second_to_last_layer_batch = strategy.run(
-                lambda x: two_output_model(x, training=False), args=(dv_batch,)
+            pred_result = _run_model_batch(
+                model,
+                dv_batch,
+                strategy=strategy,
+                return_features=True,
+                feature_model=two_output_model if _is_tf_evaluation_model(model) else None,
             )
-            second_to_last_layer_batch = strategy.gather(second_to_last_layer_batch, axis=0)
+            pred_batch, second_to_last_layer_batch = pred_result
+            second_to_last_layer_batch = _gather_if_distributed(second_to_last_layer_batch, strategy)
         else:
-            pred_batch = strategy.run(model.tf_call, args=(dv_batch,))
+            pred_batch = _run_model_batch(model, dv_batch, strategy=strategy)
 
         # shape (global_batch_size, n_output)
-        pred_batch = strategy.gather(pred_batch, axis=0)
+        pred_batch = _gather_if_distributed(pred_batch, strategy)
         # shape (global_batch_size)
-        i_example_batch = strategy.gather(index_batch[0], axis=0)
-        i_noise_batch = strategy.gather(index_batch[1], axis=0)
+        i_example_batch = _gather_if_distributed(index_batch[0], strategy)
+        i_noise_batch = _gather_if_distributed(index_batch[1], strategy)
 
         preds.append(pred_batch)
         i_examples.append(i_example_batch)
@@ -391,20 +491,20 @@ def evaluate_fiducial(
         if save_second_to_last_layer:
             second_to_last_layer.append(second_to_last_layer_batch)
 
-    preds = tf.concat(preds, axis=0)
-    i_examples = tf.concat(i_examples, axis=0)
-    i_noises = tf.concat(i_noises, axis=0)
+    preds = np.concatenate([_to_numpy(x) for x in preds], axis=0)
+    i_examples = np.concatenate([_to_numpy(x) for x in i_examples], axis=0)
+    i_noises = np.concatenate([_to_numpy(x) for x in i_noises], axis=0)
     if save_second_to_last_layer:
-        second_to_last_layer = tf.concat(second_to_last_layer_batch, axis=0)
+        second_to_last_layer = np.concatenate([_to_numpy(x) for x in second_to_last_layer], axis=0)
     LOGGER.info(f"Reshaped the results")
 
     # sort according to the example index
-    sorted_indices = tf.argsort(i_examples)
-    preds = tf.gather(preds, sorted_indices)
-    i_examples = tf.gather(i_examples, sorted_indices)
-    i_noises = tf.gather(i_noises, sorted_indices)
+    sorted_indices = np.argsort(i_examples, kind="stable")
+    preds = preds[sorted_indices]
+    i_examples = i_examples[sorted_indices]
+    i_noises = i_noises[sorted_indices]
     if save_second_to_last_layer:
-        second_to_last_layer = tf.gather(second_to_last_layer, sorted_indices)
+        second_to_last_layer = second_to_last_layer[sorted_indices]
     LOGGER.info(f"Sorted the results")
 
     out_file = _get_out_file(dir_out, file_label)
@@ -438,7 +538,9 @@ def evaluate_fiducial(
 
         LOGGER.info(f"Evaluation of the fiducial has finished, saved the predictions in {out_file}")
 
-    if isinstance(model.strategy, (tf.distribute.MultiWorkerMirroredStrategy, HorovodStrategy)):
+    if _is_tf_evaluation_model(model) and isinstance(
+        model.strategy, (tf.distribute.MultiWorkerMirroredStrategy, HorovodStrategy)
+    ):
         if model.is_chief():
             LOGGER.info(f"Chief here")
             write_out_file()
