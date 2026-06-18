@@ -26,11 +26,11 @@ GRID_EVAL_TFR="/pscratch/sd/a/athomsen/v11desy3/$VERSION/$SUBVERSION/tfrecords/g
 
 srun --cpu-bind=threads --gpu-bind=none --output=""$OUTPUT"_inference.log" \
     python ../../deep_lss/apps/run_evaluation.py \
-        --dist_strategy="mirrored" \
+        --dist_strategy="ddp" \
         --grid_vali_tfr_pattern=$GRID_EVAL_TFR \
         --dir_model="/pscratch/sd/a/athomsen/deep_lss/$VERSION/$SUBVERSION/maps/$PROBE/$MODEL"
 
 # python ../../deep_lss/apps/run_evaluation.py \
-#     --dist_strategy="mirrored" \
+#     --dist_strategy="ddp" \
 #     --grid_vali_tfr_pattern=$GRID_EVAL_TFR \
 #     --dir_model="/pscratch/sd/a/athomsen/deep_lss/$VERSION/$SUBVERSION/maps/$PROBE/$MODEL"

@@ -41,11 +41,11 @@ network:
   cls_embedding_layers: [512, 512, 512, 512]
   cls_embedding_dropout_rate: 0.5
   kwargs:
-    base_channels: 32
+    n_base_channels: 32
     # depth
-    downsampling_layers: 2
-    cheby_layers: 2
-    residual_layers: 5
+    n_downsampling: 2
+    n_cheby: 2
+    n_residuals: 5
     # misc
     poly_degree: 5
     head_type: "dense"

@@ -23,10 +23,10 @@ class ResNetLayers:
         self,
         out_features,
         # convolutions
-        base_channels=32,
-        downsampling_layers=3,
-        cheby_layers=2,
-        residual_layers=6,
+        n_base_channels=32,
+        n_downsampling=3,
+        n_cheby=2,
+        n_residuals=6,
         # regression head
         head_type="dense",
         dense_layers=None,
@@ -43,15 +43,15 @@ class ResNetLayers:
         Args:
             out_features (int, optional): Output shape of the regression head. This determines the size of the learned
                 summary statistics. Defaults to 6.
-            base_channels (int, optional): Number of channels after the first layer of the network. This number gets
+            n_base_channels (int, optional): Number of channels after the first layer of the network. This number gets
                 multiplied by a factor of two for every downsampling layer. Defaults to 32.
-            downsampling_layers (int, optional): Number of pseudoconvolutions to perform a downsampling of the
+            n_downsampling (int, optional): Number of pseudoconvolutions to perform a downsampling of the
                 neighboring Healpix pixels. Note that these layers are fairly cheap and their number effectively
                 determines how expensive the following (residual) graph convolutions are. Defaults to 3.
-            cheby_layers (int, optional): Number of Chebyshev convolutions to downsample with. These layers play the
+            n_cheby (int, optional): Number of Chebyshev convolutions to downsample with. These layers play the
                 same role as the pure downsampling layers, just include an additional (Chebyshev) graph convoution.
                 Defaults to 2.
-            residual_layers (int, optional): Number of residual layers. These are the main graph convolutions. Defaults
+            n_residuals (int, optional): Number of residual layers. These are the main graph convolutions. Defaults
                 to 6.
             head_type (str, optional): Type of regression head to be used, allowed are "dense" and "conv. Defaults to
                 "dense".
@@ -72,19 +72,19 @@ class ResNetLayers:
             LOGGER.warning("No smoothing layer is included in the network")
 
         # downsampling and increasing channels
-        n_channels = base_channels
-        for _ in range(downsampling_layers):
+        n_channels = n_base_channels
+        for _ in range(n_downsampling):
             self.layers.append(healpy_layers.HealpyPseudoConv(p=1, Fout=n_channels, activation=activation))
             n_channels *= 2
 
         # downsampling and Chebyshev convolutions
-        for _ in range(cheby_layers):
+        for _ in range(n_cheby):
             self.layers.append(healpy_layers.HealpyChebyshev(K=poly_degree, Fout=n_channels, activation=activation))
             self.layers.append(tf.keras.layers.LayerNormalization(**{"axis": -1, **norm_kwargs}))
             self.layers.append(healpy_layers.HealpyPseudoConv(p=1, Fout=n_channels, activation=activation))
 
         # residual Chebyshev convolutions
-        for _ in range(residual_layers):
+        for _ in range(n_residuals):
             self.layers.append(
                 healpy_layers.Healpy_ResidualLayer(
                     "CHEBY",
