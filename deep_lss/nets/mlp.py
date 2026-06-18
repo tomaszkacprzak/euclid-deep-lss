@@ -1,86 +1,70 @@
-# Copyright (C) 2024 ETH Zurich, Institute for Particle Physics and Astrophysics
+"""PyTorch MLP components."""
 
-"""
-Created August 2024
-Author: Arne Thomsen
-"""
+from __future__ import annotations
 
 import numpy as np
-import tensorflow as tf
-from msfm.utils import logger
+import torch
+from torch import nn
 
-LOGGER = logger.get_logger(__file__)
+import logging
+
+try:
+    from msfm.utils import logger
+except ImportError:
+    logger = None
+from deep_lss.nets import deepsphere_torch as dst
+
+LOGGER = logger.get_logger(__file__) if logger is not None else logging.getLogger(__name__)
 
 
-class PCAWhiteningLayer(tf.keras.layers.Layer):
-    """Offline PCA whitening stored as non-trainable weights inside the TF checkpoint.
-
-    Call fit() once on the training data (numpy array) before the training loop.
-    The fitted mean and projection matrix are saved with the model checkpoint and
-    restored automatically at inference time — no separate file needed.
-
-    Output dimension is n_components (< input dimension if truncated), with each
-    component having zero mean and unit variance over the training distribution.
-    LayerNorm is redundant after this layer and should be disabled in the MLP.
-    """
-
+class PCAWhiteningLayer(nn.Module):
     def __init__(self, n_components, whiten=True, eps=1e-8, **kwargs):
-        super().__init__(**kwargs)
+        super().__init__()
         self.n_components = n_components
         self.whiten = whiten
         self.eps = eps
+        self.register_buffer("mean_", torch.empty(0))
+        self.register_buffer("components_", torch.empty(0))
 
     def build(self, input_shape):
-        n_in = input_shape[-1]
+        n_in = int(input_shape[-1])
         n_out = min(self.n_components, n_in)
-        self.mean_ = self.add_weight("mean", shape=(n_in,), trainable=False, initializer="zeros")
-        self.components_ = self.add_weight("components", shape=(n_in, n_out), trainable=False, initializer="zeros")
-        super().build(input_shape)
+        self.mean_ = torch.zeros(n_in)
+        self.components_ = torch.zeros(n_in, n_out)
+        return self
 
     def fit(self, x, max_samples=200_000):
-        """Compute PCA whitening statistics from a (N, n_in) numpy array.
-
-        Subsamples to max_samples rows so covariance estimation stays fast even
-        when the full training set is large. 200k samples is more than sufficient
-        to estimate an 800×800 covariance matrix accurately.
-        """
-        if not self.built:
+        if isinstance(x, torch.Tensor):
+            x = x.detach().cpu().numpy()
+        if self.mean_.numel() == 0:
             self.build((None, x.shape[-1]))
-
         rng = np.random.default_rng(0)
         if x.shape[0] > max_samples:
-            idx = rng.choice(x.shape[0], size=max_samples, replace=False)
-            x = x[idx]
-
+            x = x[rng.choice(x.shape[0], size=max_samples, replace=False)]
         x = x.astype(np.float64)
         mean = x.mean(axis=0)
         cov = np.cov(x.T)
-
         eigvals, eigvecs = np.linalg.eigh(cov)
-        # eigh returns ascending order — reverse to descending
-        idx = np.argsort(eigvals)[::-1][: self.n_components]
-        if self.whiten:
-            components = eigvecs[:, idx] / np.sqrt(eigvals[idx] + self.eps)
-        else:
-            components = eigvecs[:, idx]
+        order = np.argsort(eigvals)[::-1]
+        idx = order[: self.n_components]
+        components = eigvecs[:, idx] / np.sqrt(eigvals[idx] + self.eps) if self.whiten else eigvecs[:, idx]
+        explained = eigvals[order][: self.n_components].sum() / eigvals.sum()
+        LOGGER.info(
+            f"PCAWhiteningLayer: kept {self.n_components}/{x.shape[1]} components, explained variance = {explained:.3f}"
+        )
+        device = self.mean_.device
+        self.mean_ = torch.as_tensor(mean, dtype=torch.float32, device=device)
+        self.components_ = torch.as_tensor(components, dtype=torch.float32, device=device)
 
-        explained = eigvals[np.argsort(eigvals)[::-1]][: self.n_components].sum() / eigvals.sum()
-        LOGGER.info(f"PCAWhiteningLayer: kept {self.n_components}/{x.shape[1]} components, "
-                    f"explained variance = {explained:.3f}")
-
-        self.mean_.assign(mean.astype(np.float32))
-        self.components_.assign(components.astype(np.float32))
-
-    def call(self, inputs):
-        return (inputs - self.mean_) @ self.components_
-
-    def get_config(self):
-        config = super().get_config()
-        config.update({"n_components": self.n_components, "whiten": self.whiten, "eps": self.eps})
-        return config
+    def forward(self, inputs):
+        if self.mean_.numel() == 0:
+            self.build((None, inputs.shape[-1]))
+            self.mean_ = self.mean_.to(inputs.device, inputs.dtype)
+            self.components_ = self.components_.to(inputs.device, inputs.dtype)
+        return (inputs - self.mean_.to(inputs.device, inputs.dtype)) @ self.components_.to(inputs.device, inputs.dtype)
 
 
-class MultiLayerPerceptron(tf.keras.Model):
+class MultiLayerPerceptron(nn.Module):
     def __init__(
         self,
         output_size,
@@ -92,38 +76,37 @@ class MultiLayerPerceptron(tf.keras.Model):
         activation="relu",
         whitening=None,
     ):
-        super(MultiLayerPerceptron, self).__init__()
-
+        super().__init__()
         self.whitening = whitening
-        # Skip LayerNorm only when whitening already provides population-level unit variance
-        # (whiten=True). With whiten=False the PCA only rotates; eigenvalue spread can be
-        # huge, so LayerNorm is still needed to prevent activation explosion.
         skip_norm = whitening is not None and whitening.whiten
         if skip_norm:
             self.norm_layer = None
         elif normalization == "layer":
-            self.norm_layer = tf.keras.layers.LayerNormalization()
+            self.norm_layer = dst.LazyLayerNorm()
         elif normalization == "batch":
-            self.norm_layer = tf.keras.layers.BatchNormalization()
+            self.norm_layer = nn.LazyBatchNorm1d()
         else:
             raise ValueError(f"Unknown normalization type: {normalization}")
-
-        self.hidden_layers = []
+        layers = []
         for _ in range(num_layers):
-            self.hidden_layers.append(tf.keras.layers.Dense(num_hidden_units, activation=activation))
+            layers.append(nn.LazyLinear(num_hidden_units))
+            act = dst.torch_activation(activation)
+            if act is not None:
+                layers.append(dst.LambdaLayer(act))
             if dropout_rate > 0:
-                self.hidden_layers.append(tf.keras.layers.Dropout(dropout_rate))
-
+                layers.append(nn.Dropout(dropout_rate))
         if num_penultimate is not None:
             LOGGER.info("Including a penultimate layer in the MLP")
-            self.hidden_layers.append(tf.keras.layers.Dense(num_penultimate, name="penultimate"))
+            layers.append(nn.LazyLinear(num_penultimate))
+        self.hidden_layers = nn.ModuleList(layers)
+        self.output_layer = nn.LazyLinear(output_size)
 
-        self.output_layer = tf.keras.layers.Dense(output_size, name="output")
-
-    def call(self, inputs, training=False):
+    def forward(self, inputs, training=None):
+        if training is not None:
+            self.train(bool(training))
         x = self.whitening(inputs) if self.whitening is not None else inputs
         if self.norm_layer is not None:
             x = self.norm_layer(x)
         for layer in self.hidden_layers:
-            x = layer(x, training=training)
+            x = layer(x)
         return self.output_layer(x)

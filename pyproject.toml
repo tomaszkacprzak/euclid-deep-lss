@@ -60,8 +60,8 @@ dev = [
 Repository = "https://github.com/des-science/y3-deep-lss"
 Documentation = "https://arxiv.org/abs/2511.04681"
 
-[tool.setuptools]
-packages = ["deep_lss"]
+[tool.setuptools.packages.find]
+include = ["deep_lss", "deep_lss.*"]
 
 [tool.setuptools.package-data]
 deep_lss = ["*.yaml", "*.yml"]
