@@ -35,14 +35,14 @@ dependencies = [
     "wandb",
     "icecream",
     "pandas>=2.2.3",
+    "torch",
+    "deepsphere-cosmo-pytorch @ git+https://github.com/tomaszkacprzak/deepsphere-cosmo-pytorch.git",
 ]
 
 [project.optional-dependencies]
-# Only for environments where TensorFlow/Horovod are not pre-installed
-tf = [
+# Optional TensorFlow reader support for legacy TFRecord datasets.
+tfrecord = [
     "tensorflow>=2.0",
-    "tensorflow-probability",
-    "horovod[tensorflow]",
 ]
 
 # Development tools
