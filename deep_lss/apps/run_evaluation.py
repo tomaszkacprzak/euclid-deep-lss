@@ -9,7 +9,7 @@ Evaluate the DeepSphere graph neural networks on the grid of cosmologies sampled
 Meant for the GPU nodes of the Perlmutter cluster at NERSC.
 """
 
-import tensorflow as tf
+from deep_lss.data.tfrecords import tf
 
 for gpu in tf.config.list_physical_devices("GPU"):
     tf.config.experimental.set_memory_growth(gpu, True)
