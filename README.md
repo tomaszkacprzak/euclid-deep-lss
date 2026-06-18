@@ -33,6 +33,24 @@ pip install -e .[tfrecord]
 
 TensorFlow is not installed by default, and the default installation no longer includes TensorFlow Probability or Horovod.
 
+## TensorFlow import policy
+
+This repository is PyTorch-first. TensorFlow is allowed only in documented TFRecord compatibility modules whose sole purpose is reading legacy `.tfrecord` datasets, currently `deep_lss/data/tfrecords.py`. Data parsed by those compatibility modules must cross the boundary into the rest of `deep_lss` as PyTorch tensors; active model, network, training, evaluation, loss, and distribution code must not accept or propagate TensorFlow tensors.
+
+Do not add TensorFlow, `horovod.tensorflow`, `tensorflow_probability`, or the old TensorFlow `deepsphere` package to active code. New spherical CNN work should use the PyTorch DeepSphere dependency documented above. If a compatibility module is needed for TFRecord ingestion, document the module here and keep its public output type as PyTorch tensors.
+
+Run the import-policy check before submitting changes:
+
+```bash
+ci/check_tensorflow_policy.sh
+```
+
+The check includes this TensorFlow search and excludes notebooks:
+
+```bash
+rg "import tensorflow|from tensorflow|tf\." deep_lss -g '!*.ipynb'
+```
+
 ## Repository Structure
 
 ### `deep_lss`
