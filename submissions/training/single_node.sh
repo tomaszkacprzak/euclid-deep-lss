@@ -20,7 +20,7 @@ PROBE="lensing"
 # PROBE="combined"
 
 RUN_NUM=${RUN_NUM:-1}
-STRATEGY="mirrored"
+STRATEGY="ddp"
 LOSS="mutual_info"
 
 BASE="/pscratch/sd/a/athomsen/deep_lss/$VERSION/$SUBVERSION/maps/$PROBE"

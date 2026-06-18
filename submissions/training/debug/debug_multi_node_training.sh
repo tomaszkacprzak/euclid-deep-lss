@@ -8,10 +8,10 @@
 #SBATCH --gpus-per-node=4
 #SBATCH --gpus-per-task=1
 #SBATCH --cpus-per-task=32
-#SBATCH --job-name=hvd_training_debug
+#SBATCH --job-name=ddp_training_debug
 #SBATCH --output="./logs/v15/training_debug_%j.log"
 
-STRATEGY="horovod"
+STRATEGY="ddp"
 VERSION="v15"
 
 # PROBE="lensing"

@@ -12,7 +12,7 @@
 #SBATCH --output="./logs/v15/training_debug_%j.log"
 
 RUN_NUM=${RUN_NUM:-1}
-STRATEGY="mirrored"
+STRATEGY="ddp"
 VERSION="v15"
 
 PROBE="lensing"

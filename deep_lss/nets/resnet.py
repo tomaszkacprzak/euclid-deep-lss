@@ -19,10 +19,12 @@ class ResNetLayers:
     def __init__(
         self,
         out_features,
-        base_channels=32,
-        downsampling_layers=3,
-        cheby_layers=2,
-        residual_layers=6,
+        # convolutions
+        n_base_channels=32,
+        n_downsampling=3,
+        n_cheby=2,
+        n_residuals=6,
+        # regression head
         head_type="dense",
         dense_layers=None,
         dropout_rate=None,
