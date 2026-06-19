@@ -10,34 +10,31 @@ This repository contains the pipeline to train neural networks that learn inform
 
 ## Installation
 
-Requires Python >= 3.8, TensorFlow >= 2.0, TensorFlow-Probability, and Horovod.
+Requires Python >= 3.8. The default install includes the shared scientific Python stack; install the `torch` extra to add PyTorch, torchvision, and Pyro.
 
 **Main dependencies:**
 - [`euclid-multiprobe-simulation-forward-model`](https://github.com/tomaszkacprzak/euclid-multiprobe-simulation-forward-model/) for data loading and utilities
-- [`deepsphere-cosmo-tf2`](https://github.com/deepsphere/deepsphere-cosmo-tf2) for graph convolutional neural networks on the pixelized sphere
+- PyTorch for neural network training and native distributed execution via `torch.distributed`/`torchrun`.
+- torchvision for vision model components and transforms.
+- Pyro for probabilistic modeling utilities used by PyTorch-based replacements.
 
 **Step 1: Install dependencies from GitHub**
 ```bash
 # Install euclid-multiprobe-simulation-forward-model (data loading)
 pip install git+https://github.com/tomaszkacprzak/euclid-multiprobe-simulation-forward-model.git
-
-# Install deepsphere-cosmo-tf2 (graph convolutional networks in TensorFlow 2)
-pip install git+https://github.com/deepsphere/deepsphere-cosmo-tf2.git
 ```
 
-**Step 2: Install this package**
+**Step 2: Install this package with the PyTorch runtime**
+```bash
+pip install -e .[torch]
+```
 
-*On HPC clusters with pre-installed TensorFlow/Horovod* (recommended):
+On HPC clusters with a site-managed PyTorch/CUDA stack, install the package without the extra after loading the appropriate modules or activating the managed environment:
 ```bash
 pip install -e .
 ```
 
-*On systems without TensorFlow/Horovod*:
-```bash
-pip install -e .[tf]
-```
-
-Use the first option when TensorFlow and Horovod are available via system modules (e.g., `module load tensorflow horovod`) to preserve optimized GPU/MPI configurations.
+Distributed training should be launched with native PyTorch tooling such as `torchrun`; no Horovod dependency is installed by this package.
 
 ## Repository Structure
 
